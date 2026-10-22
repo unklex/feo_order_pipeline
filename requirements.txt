@@ -1,0 +1,10 @@
+pandas
+requests
+sqlalchemy
+sshtunnel
+pymysql
+paramiko
+tqdm
+selenium
+fast_bitrix24
+python-dotenv

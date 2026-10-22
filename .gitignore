@@ -1,0 +1,32 @@
+# Секреты — никогда не коммитить
+.env
+
+# Логи
+bitrix_create_*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.log
+
+# Секреты и сессии
+.env
+gisopvk_webapi_cookies.json
+
+# Данные и выгрузки (большие / генерируемые)
+parsed_bids/
+chk_*/
+export/
+opvk-export*/
+opvk-export*.zip
+gisopvk_webapi_*.jsonl.gz
+gisopvk_webapi_*_stats.json
+gisopvk_webapi_progress.txt
+progress/
+reports/
+logs/
+*.log
+
+# IDE
+.idea/

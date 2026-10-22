@@ -1,0 +1,10 @@
+[project]
+name = "feo-order-pipeline"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "pandas>=3.0.5",
+    "requests>=2.34.2",
+    "sqlalchemy>=2.0.52",
+    "sshtunnel>=0.4.0",
+]
