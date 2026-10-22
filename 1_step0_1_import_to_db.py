@@ -25,6 +25,11 @@ from sqlalchemy import create_engine, text
 from sshtunnel import SSHTunnelForwarder, BaseSSHTunnelForwarderError
 import pymysql
 
+from audit_log import AuditLog
+
+# JSONL-журнал итогов по архивам для анализа после запуска (создаётся в main)
+audit = None
+
 # Определяем путь к папке с логами
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -318,7 +323,35 @@ def save_minimal_to_database(df: pd.DataFrame, engine) -> Tuple[int, int]:
             rows_added = result.rowcount
             logger.info(f"✅ Добавлено {rows_added} новых записей")
 
-            # 2. ОБНОВЛЯЕМ ТОЛЬКО НЕСИНХРОНИЗИРОВАННЫЕ ЗАПИСИ
+            # 2. СБРОС СТАТУСА СИНХРОНИЗАЦИИ ПРИ КРИТИЧЕСКИХ ИЗМЕНЕНИЯХ
+            # Идёт ДО обновления полей: сброшенная запись становится 'pending' и получает
+            # новые значения в шаге 3 этого же запуска (раньше — только при следующем).
+            # NOT (a <=> b) вместо a != b: != с NULL даёт NULL, и переход NULL <-> значение
+            # не считался изменением.
+            logger.info("Проверка критических изменений в синхронизированных записях")
+            reset_sync_query = text(f"""
+                UPDATE {table_name} AS target
+                JOIN {temp_table_name} AS source ON target.id = source.id
+                SET
+                    target.bitrix_sync_status = 'pending',
+                    target.bitrix_last_sync = NULL,
+                    target.bitrix_error_message = 'Требует пересинхронизации из-за критических изменений',
+                    target.updated_at = NOW()
+                WHERE
+                    target.bitrix_sync_status = 'synced'
+                    AND (
+                        NOT (target.cost <=> source.cost) OR
+                        NOT (target.accrual_status <=> source.accrual_status) OR
+                        NOT (target.status_label <=> source.status_label)
+                    )
+            """)
+
+            result = conn.execute(reset_sync_query)
+            reset_count = result.rowcount
+            if reset_count > 0:
+                logger.warning(f"⚠️ Сброшен статус синхронизации для {reset_count} записей из-за критических изменений")
+
+            # 3. ОБНОВЛЯЕМ ТОЛЬКО НЕСИНХРОНИЗИРОВАННЫЕ ЗАПИСИ
             # Защищаем уже синхронизированные записи от изменений
             logger.info("Обновление несинхронизированных записей")
             update_query = text(f"""
@@ -342,10 +375,10 @@ def save_minimal_to_database(df: pd.DataFrame, engine) -> Tuple[int, int]:
                 WHERE 
                     target.bitrix_sync_status IN ('pending', 'error')
                     AND (
-                        target.status_label != source.status_label OR
-                        target.cost != source.cost OR
-                        target.accrual_status != source.accrual_status OR
-                        target.is_active != source.is_active
+                        NOT (target.status_label <=> source.status_label) OR
+                        NOT (target.cost <=> source.cost) OR
+                        NOT (target.accrual_status <=> source.accrual_status) OR
+                        NOT (target.is_active <=> source.is_active)
                     )
             """)
 
@@ -353,7 +386,7 @@ def save_minimal_to_database(df: pd.DataFrame, engine) -> Tuple[int, int]:
             rows_updated = result.rowcount
             logger.info(f"✅ Обновлено {rows_updated} несинхронизированных записей")
 
-            # 3. ЛОГИРУЕМ ПРОПУЩЕННЫЕ СИНХРОНИЗИРОВАННЫЕ ЗАПИСИ
+            # 4. ЛОГИРУЕМ ПРОПУЩЕННЫЕ СИНХРОНИЗИРОВАННЫЕ ЗАПИСИ
             count_synced_query = text(f"""
                 SELECT COUNT(*) as synced_count
                 FROM {table_name} AS target
@@ -366,30 +399,9 @@ def save_minimal_to_database(df: pd.DataFrame, engine) -> Tuple[int, int]:
             if synced_count > 0:
                 logger.info(f"ℹ️ Пропущено {synced_count} уже синхронизированных записей")
 
-            # 4. СБРОС СТАТУСА СИНХРОНИЗАЦИИ ПРИ КРИТИЧЕСКИХ ИЗМЕНЕНИЯХ
-            # Если изменились критические поля, сбрасываем статус синхронизации
-            logger.info("Проверка критических изменений в синхронизированных записях")
-            reset_sync_query = text(f"""
-                UPDATE {table_name} AS target
-                JOIN {temp_table_name} AS source ON target.id = source.id
-                SET
-                    target.bitrix_sync_status = 'pending',
-                    target.bitrix_last_sync = NULL,
-                    target.bitrix_error_message = 'Требует пересинхронизации из-за критических изменений',
-                    target.updated_at = NOW()
-                WHERE 
-                    target.bitrix_sync_status = 'synced'
-                    AND (
-                        target.cost != source.cost OR
-                        target.accrual_status != source.accrual_status OR
-                        target.status_label != source.status_label
-                    )
-            """)
-
-            result = conn.execute(reset_sync_query)
-            reset_count = result.rowcount
-            if reset_count > 0:
-                logger.warning(f"⚠️ Сброшен статус синхронизации для {reset_count} записей из-за критических изменений")
+            if audit is not None:
+                audit.write("db_merge", rows_in_file=len(df), rows_added=rows_added,
+                            rows_updated=rows_updated, sync_reset=reset_count, synced_untouched=synced_count)
 
             # Удаляем временную таблицу
             drop_query = text(f"DROP TABLE IF EXISTS {temp_table_name}")
@@ -420,6 +432,8 @@ def process_archive(archive_path: str, engine) -> Tuple[int, int, int]:
             return 0, 0, 0
 
         # Сохраняем в БД
+        if audit is not None:
+            audit.write("archive_start", archive=os.path.basename(archive_path), rows_raw=len(df_raw))
         rows_added, rows_updated = save_minimal_to_database(df_prepared, engine)
 
         total_processed = len(df_prepared)
@@ -430,6 +444,8 @@ def process_archive(archive_path: str, engine) -> Tuple[int, int, int]:
 
     except Exception as e:
         logger.error(f"Ошибка при обработке архива {archive_path}: {e}")
+        if audit is not None:
+            audit.write("archive_error", archive=os.path.basename(archive_path), error=str(e))
         return 0, 0, 0
 
 
@@ -494,7 +510,10 @@ def check_database_structure(engine):
 
 def main():
     """Основная функция скрипта"""
+    global audit
     logger.info("Запуск улучшенного импорта минимальных данных заказов")
+    audit = AuditLog("import_to_db")
+    logger.info(f"Журнал итогов (JSONL): {audit.path}")
 
     # Создание SSH-туннеля
     logger.info("Создание SSH-туннеля")
@@ -599,6 +618,7 @@ def main():
         if 'tunnel' in locals() and tunnel.is_active:
             logger.info("Закрытие SSH-туннеля")
             tunnel.stop()
+        audit.close()
 
 
 if __name__ == "__main__":

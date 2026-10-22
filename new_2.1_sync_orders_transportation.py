@@ -53,7 +53,16 @@ except ImportError:
 if os.environ.get("BITRIX_LIB_DIR"):
     sys.path.append(os.environ["BITRIX_LIB_DIR"])
 from bitrix_config import b
+from audit_log import AuditLog
 #from tg_bot import send
+
+# JSONL-журнал вызовов Битрикс для анализа после запуска (создаётся в main)
+audit = None
+
+
+def _audit(event, **data):
+    if audit is not None:
+        audit.write(event, **data)
 
 # Настройка логирования
 logging.basicConfig(
@@ -312,15 +321,18 @@ async def create_orders_in_bitrix_async(b, orders_to_create, entity_type_id, max
                     created_id = result['result']['item']['id']
                     created_orders.append({'bid_id': row['bid_id'], 'bitrix_id': created_id})
                     success_count += 1
+                    _audit("item_add", bid_id=row['bid_id'], ok=True, item_id=created_id)
                     return True, created_id
                 else:
                     logger.error(f"Неожиданный ответ API при создании заказа {row['bid_id']}")
                     error_count += 1
+                    _audit("item_add", bid_id=row['bid_id'], ok=False, error="unexpected_response", response=result)
                     return False, None
 
             except Exception as e:
                 logger.error(f"Ошибка при создании заказа {row['bid_id']}: {str(e)}")
                 error_count += 1
+                _audit("item_add", bid_id=row['bid_id'], ok=False, error=str(e))
                 return False, None
             finally:
                 pbar.update(1)
@@ -371,7 +383,10 @@ def create_orders_in_bitrix(b, orders_to_create, entity_type_id=None, max_concur
 
 def main():
     """Основная функция скрипта создания заказов в Битрикс24"""
+    global audit
     logger.info("Запуск упрощенного скрипта создания заказов в Битрикс24")
+    audit = AuditLog("sync_orders")
+    logger.info(f"Журнал вызовов Битрикс (JSONL): {audit.path}")
 
     db = DatabaseConnection()
 
@@ -428,6 +443,8 @@ def main():
                 updated_count += 1
             else:
                 failed_updates.append(created_order['bid_id'])
+                # Элемент в Битрикс создан, но id не записан в БД — при следующем запуске будет дубль
+                _audit("db_update_failed", bid_id=created_order['bid_id'], item_id=created_order['bitrix_id'])
 
         message = (
             f"Создание заказов в Битрикс24 завершено:\n"
@@ -445,16 +462,20 @@ def main():
         print("=" * 60)
 
         logger.info(message.replace("\n", " | "))
+        _audit("run_summary", without_bitrix_id=len(db_orders), created=len(created_orders),
+               db_updated=updated_count, db_update_failed=len(failed_updates))
         #send(message)
 
     except Exception as e:
         error_message = f"Критическая ошибка в скрипте создания заказов: {e}"
         logger.error(error_message)
         logger.debug(traceback.format_exc())
+        _audit("fatal_error", error=str(e))
         #send(error_message)
 
     finally:
         db.close()
+        audit.close()
         logger.info("Упрощенный скрипт создания заказов в Битрикс24 завершен")
 
 

@@ -64,6 +64,15 @@ except ImportError:
 # а bx24_import при импорте поднимал лишний SSH-туннель через db_connection.
 sys.path.insert(0, os.environ.get("BITRIX_LIB_DIR", os.path.dirname(os.path.abspath(__file__))))
 from bitrix_config import b  # асинхронный клиент Битрикс24 (fast_bitrix24)
+from audit_log import AuditLog
+
+# JSONL-журнал вызовов Битрикс для анализа после запуска (создаётся в main_async)
+audit = None
+
+
+def _audit(event, **data):
+    if audit is not None:
+        audit.write(event, **data)
 
 
 # ===========================================================================
@@ -413,6 +422,26 @@ def extract_main(record):
     }
 
 
+def _id_str(series: pd.Series) -> pd.Series:
+    """Числовой ID -> строка без '.0' ('156321'); пустой/нечисловой -> пропуск (NaN).
+
+    Ключи-пропуски нужно отбрасывать из правой таблицы перед merge:
+    pandas сопоставляет NaN с NaN, и строки без ID склеивались бы между собой.
+    """
+    ids = pd.to_numeric(series, errors='coerce').astype('Int64')
+    # .where: в pandas < 3 astype(str) превращает NA в строку '<NA>'
+    return ids.astype(str).where(ids.notna())
+
+
+def _contract_label(number, init_date):
+    """'<номер> от <дата>'; без номера — None (поле в Битрикс не трогаем), без даты — только номер."""
+    if pd.isna(number) or not str(number).strip():
+        return None
+    if pd.isna(init_date) or not str(init_date).strip():
+        return str(number)
+    return f"{number} от {init_date}"
+
+
 def build_merged_dataframe(data: list) -> pd.DataFrame:
     """Строит объединённый DataFrame из JSON-записей."""
     df_wasteplace = pd.DataFrame([extract_wasteplace(rec) for rec in data])
@@ -521,6 +550,7 @@ async def import_companies_to_bitrix(db: DatabaseConnection, missing_ids) -> int
             if asyncio.iscoroutine(result):
                 result = await result
 
+            _audit("company_add", org_id=company_id, name_short=name_short, ok=bool(result), bitrix_company_id=result)
             if result:
                 def do_update(engine, _co_id=result, _id=company_id):
                     with engine.begin() as conn:
@@ -538,6 +568,7 @@ async def import_companies_to_bitrix(db: DatabaseConnection, missing_ids) -> int
 
         except Exception as e:
             logger.error(f"[X] Ошибка при добавлении ID {company_id}: {e}")
+            _audit("company_add", org_id=company_id, name_short=name_short, ok=False, error=str(e))
 
     if imported_companies:
         try:
@@ -561,9 +592,11 @@ async def update_single_item(item_id, fields) -> bool:
             'id': item_id,
             'fields': fields,
         })
+        _audit("item_update", item_id=item_id, ok=True, fields=fields)
         return True
     except Exception as e:
         logger.error(f"Ошибка при обновлении записи {item_id}: {e}")
+        _audit("item_update", item_id=item_id, ok=False, error=str(e), fields=fields)
         return False
 
 
@@ -635,12 +668,14 @@ async def update_all_in_parallel(dataframe, id_column, field_mappings, max_concu
         if id_column not in row or pd.isna(row[id_column]):
             skipped_count += 1
             skipped_no_id += 1
+            _audit("skip", reason="no_bitrix_id", bid_id=row.get('bid_id'))
             continue
         try:
             record_id = int(float(row[id_column]))
         except (ValueError, TypeError):
             skipped_count += 1
             skipped_no_id += 1
+            _audit("skip", reason="bad_bitrix_id", bid_id=row.get('bid_id'), bitrix_id=row[id_column])
             continue
 
         update_fields = _build_update_fields(row, field_mappings)
@@ -649,6 +684,7 @@ async def update_all_in_parallel(dataframe, id_column, field_mappings, max_concu
         else:
             skipped_count += 1
             skipped_no_fields += 1
+            _audit("skip", reason="no_fields", bid_id=row.get('bid_id'), item_id=record_id)
 
     if skipped_count:
         logger.info(
@@ -732,7 +768,7 @@ FIELD_MAPPINGS = {
     'ufCrm16_1753949514': 'contact_phone',
     'ufCrm16_1753949527': 'contact_phone_mobile',
     'ufCrm16_1753949539': 'contact_name',
-    'ufCrm16_1751570883': 'facility_lot',
+    'ufCrm16_1751570883': 'facility_lon',
     'ufCrm16_1751570873': 'facility_lat',
     'ufCrm16_1751570862': 'wasteplace_point_lon',
     'ufCrm16_1751570847': 'wasteplace_point_lat',
@@ -807,8 +843,12 @@ async def run_pipeline(db: DatabaseConnection, json_file: str, max_concurrent: i
         return
 
     # 3. Объединение JSON + заказы
-    orders['bid_id'] = pd.to_numeric(orders['bid_id'], errors='coerce').astype('Int64').astype(str)
-    df_merged['bid_id'] = pd.to_numeric(df_merged['bid_id'], errors='coerce').astype('Int64').astype(str)
+    orders['bid_id'] = _id_str(orders['bid_id'])
+    df_merged['bid_id'] = _id_str(df_merged['bid_id'])
+    no_bid = orders['bid_id'].isna()
+    if no_bid.any():
+        logger.warning(f"Заказов в БД без bid_id (не сопоставляются с JSON): {int(no_bid.sum())}")
+        orders = orders[~no_bid]
     df_joined = df_merged.merge(orders, on='bid_id', how='left')
 
     # Диагностика: сколько JSON-записей реально сопоставилось с заказами и имеет bitrix_id
@@ -860,19 +900,20 @@ async def run_pipeline(db: DatabaseConnection, json_file: str, max_concurrent: i
         bot = read_companies(db)  # перечитываем после импорта
 
     # 8. Приклеиваем утилизатора (executor_recycling) и отходообразователя (organization)
+    # Компании без числового oi_id отбрасываем: иначе их NaN-ключ склеится
+    # с заказами без утилизатора/отходообразователя и подставит чужую компанию.
     if not bot.empty:
-        bot['oi_id'] = pd.to_numeric(bot['oi_id'], errors='coerce').dropna().astype('int64').astype(str)
+        bot['oi_id'] = _id_str(bot['oi_id'])
+        bot = bot.dropna(subset=['oi_id'])
 
-    df_joined['executor_recycling_id'] = pd.to_numeric(
-        df_joined['executor_recycling_id'], errors='coerce').astype('Int64').astype(str).replace('<NA>', None)
+    df_joined['executor_recycling_id'] = _id_str(df_joined['executor_recycling_id'])
     df_joined = df_joined.merge(
         bot[['oi_id', 'oi_bx_id']], left_on='executor_recycling_id', right_on='oi_id', how='left'
     ).rename(columns={'oi_bx_id': 'bitrix_executor_recycling_id'})
     if 'oi_id' in df_joined.columns:
         df_joined = df_joined.drop(columns=['oi_id'])
 
-    df_joined['organization_id'] = pd.to_numeric(
-        df_joined['organization_id'], errors='coerce').astype('Int64').astype(str).replace('<NA>', None)
+    df_joined['organization_id'] = _id_str(df_joined['organization_id'])
     df_joined = df_joined.merge(
         bot[['oi_id', 'oi_bx_id']], left_on='organization_id', right_on='oi_id', how='left'
     ).rename(columns={'oi_bx_id': 'bitrix_organization_id'})
@@ -883,20 +924,22 @@ async def run_pipeline(db: DatabaseConnection, json_file: str, max_concurrent: i
     df_joined['org_id_mapped'] = df_joined['org_name'].map(ORG_NAME_MAP) if 'org_name' in df_joined.columns else None
 
     # 10. Заголовок
+    # id после left merge — float (есть пропуски), поэтому без _id_str было бы '…/111044.0';
+    # без обоих ID заголовок не формируем (None — поле не отправляется).
+    transport_id = _id_str(df_joined['id'])
     df_joined['title'] = (
-        'Заказ на транспортирование ' + df_joined['bid_id'].astype(str) + '/' + df_joined['id'].astype(str)
-    )
+        'Заказ на транспортирование ' + df_joined['bid_id'] + '/' + transport_id
+    ).where(df_joined['bid_id'].notna() & transport_id.notna())
 
     # 11. Чистим служебные колонки и дубли
     df_joined.drop(columns=[c for c in COLS_TO_DROP if c in df_joined.columns], inplace=True)
     df_joined = df_joined.loc[:, ~df_joined.columns.duplicated()]
 
     # 12. split_contract
-    df_joined["split_contract"] = (
-        df_joined["transport_contract_number"].astype(str)
-        + " от "
-        + df_joined["transport_contract_init_date"].astype(str)
-    )
+    df_joined["split_contract"] = [
+        _contract_label(number, init_date)
+        for number, init_date in zip(df_joined["transport_contract_number"], df_joined["transport_contract_init_date"])
+    ]
 
     # 12a. Защита от дублей: на один элемент Битрикс — ровно одна строка.
     # Полные дубли схлопываем; если строки для одного bitrix_id расходятся (например, из-за
@@ -911,6 +954,7 @@ async def run_pipeline(db: DatabaseConnection, json_file: str, max_concurrent: i
                 f"Расходящиеся строки для одного элемента Битрикс ({len(conflict_ids)}), пропущены: "
                 f"bitrix_id={conflict_ids}, bid_id={sorted(conflicts['bid_id'].astype(str).unique())}"
             )
+            _audit("skip", reason="conflicting_rows", bitrix_ids=conflict_ids)
             df_joined = df_joined.drop(conflicts.index)
 
     # 13. Сортировка (для наглядности прогресса)
@@ -922,10 +966,17 @@ async def run_pipeline(db: DatabaseConnection, json_file: str, max_concurrent: i
     result = await run_parallel_update(df_joined, 'bitrix_id', FIELD_MAPPINGS, max_concurrent)
 
     # 15. Пометка успешно обновлённых заказов bitrix_filled=1
-    mark_orders_filled(db, result.get('successful_item_ids', []))
+    marked = mark_orders_filled(db, result.get('successful_item_ids', []))
+
+    _audit("run_summary", json_file=json_file, json_records=len(data), orders_to_fill=len(orders),
+           rows_to_update=len(df_joined), marked_filled=marked,
+           **{k: v for k, v in result.items() if k != 'successful_item_ids'})
 
 
 async def main_async(args):
+    global audit
+    audit = AuditLog("fill_db")
+    logger.info(f"Журнал вызовов Битрикс (JSONL): {audit.path}")
     db = DatabaseConnection()
     try:
         db.reconnect()
@@ -933,8 +984,10 @@ async def main_async(args):
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}")
         logger.debug(traceback.format_exc())
+        _audit("fatal_error", error=str(e))
     finally:
         db.close()
+        audit.close()
         logger.info("Скрипт заполнения БД завершён")
 
 

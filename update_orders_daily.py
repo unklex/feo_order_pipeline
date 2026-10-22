@@ -32,7 +32,7 @@ import re
 import time
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -44,6 +44,15 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 # Локальные модули проекта
 from bitrix_config import b
 from env_config import require_env, env_int  # значения из .env
+from audit_log import AuditLog
+
+# JSONL-журнал вызовов Битрикс для анализа после запуска (создаётся в main)
+audit = None
+
+
+def _audit(event, **data):
+    if audit is not None:
+        audit.write(event, **data)
 
 # =============================================================================
 # КОНФИГУРАЦИЯ
@@ -285,16 +294,28 @@ def extract_facility_phone(order_data: dict) -> str | None:
     return None
 
 
+MSK = timezone(timedelta(hours=3))  # Europe/Moscow: постоянно UTC+3 с 2014 г.
+
+
+def to_msk(value: str) -> datetime:
+    """ISO-дата ФГИС -> московское время.
+
+    История статусов приходит в UTC (+00:00), остальные поля — в +03:00. Раньше
+    смещение просто отрезалось, и события 00:00–03:00 МСК попадали на предыдущий день.
+    """
+    dt = datetime.fromisoformat(value)  # Python 3.11+: понимает и 'Z', и смещения
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=MSK)
+    return dt.astimezone(MSK)
+
+
 def format_history(status_history: list) -> str:
     """Форматирует историю статусов начиная с первого updating-operator."""
     if not status_history:
         return ""
 
     # Сортируем историю по дате
-    sorted_history = sorted(
-        status_history,
-        key=lambda x: datetime.fromisoformat(x['dt'].replace('Z', '+00:00').replace('+00:00', ''))
-    )
+    sorted_history = sorted(status_history, key=lambda x: to_msk(x['dt']))
 
     # Находим первый updating-operator
     start_index = -1
@@ -308,10 +329,10 @@ def format_history(status_history: list) -> str:
     # Форматируем текст
     history_lines = []
     for record in filtered_history:
-        dt = datetime.fromisoformat(record['dt'].replace('Z', '+00:00').replace('+00:00', ''))
-        date_str = dt.strftime('%d.%m.%Y')
-        author = record.get('author', 'Система')
-        comment = record.get('comment', '')
+        date_str = to_msk(record['dt']).strftime('%d.%m.%Y')
+        # author/comment приходят как null — get(..., default) их не подменял ("автор: None")
+        author = record.get('author') or 'Система'
+        comment = record.get('comment') or ''
         label = record['label']
 
         if comment:
@@ -338,8 +359,7 @@ def process_order(order_data: dict) -> dict | None:
         dt_create_formatted = None
         if basic_info.get('dt_create'):
             try:
-                dt = datetime.fromisoformat(basic_info['dt_create'].replace('Z', '+00:00').replace('+00:00', ''))
-                dt_create_formatted = dt.strftime('%d-%m-%Y')
+                dt_create_formatted = to_msk(basic_info['dt_create']).strftime('%d-%m-%Y')
             except:
                 dt_create_formatted = basic_info.get('dt_create')
 
@@ -406,9 +426,11 @@ async def update_single_item(b, item_id: int, fields: dict) -> bool:
             'id': item_id,
             'fields': fields
         })
+        _audit("item_update", item_id=item_id, ok=True, fields=fields)
         return True
     except Exception as e:
         logger.error(f"Ошибка при обновлении записи {item_id}: {e}")
+        _audit("item_update", item_id=item_id, ok=False, error=str(e), fields=fields)
         return False
 
 
@@ -462,12 +484,14 @@ async def update_all_in_parallel(
     for _, row in dataframe.iterrows():
         if id_column not in row or pd.isna(row[id_column]):
             skipped_count += 1
+            _audit("skip", reason="no_bitrix_id", order_id=row.get('ID заказа'), bid_id=row.get('ID заявки'))
             continue
 
         try:
             record_id = int(float(row[id_column]))
         except (ValueError, TypeError):
             skipped_count += 1
+            _audit("skip", reason="bad_bitrix_id", order_id=row.get('ID заказа'), bitrix_id=row[id_column])
             continue
 
         update_fields = {}
@@ -564,6 +588,8 @@ async def verify_sample(df_joined: pd.DataFrame, bid_id: str):
             r = r[key]
     actual = str(r.get('ufCrm16_1754900128')) if isinstance(r, dict) else None
 
+    _audit("verify_sample", bid_id=bid_id, item_id=bitrix_id, expected=expected, actual=actual,
+           ok=actual == expected)
     if actual == expected:
         logger.info(f"✅ Контрольная сверка OK: заявка {bid_id}, bitrix_id={bitrix_id}, статус={actual}")
     else:
@@ -596,6 +622,9 @@ def main():
         logger.error(f"Файл не найден: {input_file}")
         sys.exit(1)
 
+    global audit
+    audit = AuditLog("update_orders_daily")
+    logger.info(f"Журнал вызовов Битрикс (JSONL): {audit.path}")
     logger.info(f"Начало обработки файла: {input_file}")
     logger.info(f"Время запуска: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -620,6 +649,7 @@ def main():
         logger.info(f"Успешно обработано: {len(processed_orders)} из {len(orders_data)}")
         if failed_orders:
             logger.warning(f"Не удалось обработать: {len(failed_orders)} заказов")
+            _audit("parse_failed", orders=failed_orders)
 
         # 3. Создаём DataFrame
         df = pd.DataFrame(processed_orders)
@@ -642,7 +672,14 @@ def main():
 
         # 7а. Одна заявка может иметь несколько транспортирований в файле —
         # оставляем актуальное (is_active, затем самое свежее по dt_update)
-        df_merged['ID заказа'] = df_merged['ID заказа'].astype(int).astype(str)
+        # Нечисловой ID ('unknown' из process_order) раньше ронял весь запуск на astype(int)
+        order_ids = pd.to_numeric(df_merged['ID заказа'], errors='coerce').astype('Int64')
+        if order_ids.isna().any():
+            bad = df_merged.loc[order_ids.isna(), 'ID заказа'].tolist()
+            logger.warning(f"Пропущены записи с некорректным ID заказа ({len(bad)}): {bad[:20]}")
+            _audit("skip", reason="bad_order_id", order_ids=bad)
+            df_merged, order_ids = df_merged[order_ids.notna()].copy(), order_ids[order_ids.notna()]
+        df_merged['ID заказа'] = order_ids.astype(str)
         before_dedup = len(df_merged)
         has_bid = df_merged['ID заявки'].notna()
         df_with_bid = (df_merged[has_bid]
@@ -707,6 +744,7 @@ def main():
         unmapped = df_joined[df_joined['Текущий статус_id'].isna()]['Текущий статус'].unique()
         if len(unmapped):
             logger.warning(f"Статусы без маппинга (не будут обновлены): {list(unmapped)}")
+            _audit("unmapped_status", statuses=list(unmapped))
 
         # 9. Обновляем Bitrix24
         logger.info("Начинаю обновление Bitrix24...")
@@ -718,13 +756,20 @@ def main():
         if VERIFY_SAMPLE_BID_ID:
             asyncio.run(verify_sample(df_joined, VERIFY_SAMPLE_BID_ID))
 
+        _audit("run_summary", input_file=input_file, orders_in_file=len(orders_data),
+               failed_to_parse=len(failed_orders), rows=len(df_joined),
+               matched_by_bid=int(matched_by_bid), matched_total=int(matched), **result)
         logger.info(f"Обработка завершена: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
         return result
 
     except Exception as e:
         logger.exception(f"Критическая ошибка: {e}")
+        _audit("fatal_error", error=str(e))
         sys.exit(1)
+
+    finally:
+        audit.close()
 
 
 if __name__ == "__main__":
