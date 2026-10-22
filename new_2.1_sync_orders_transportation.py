@@ -27,14 +27,7 @@ from tqdm import tqdm
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError, DBAPIError
-from sshtunnel import SSHTunnelForwarder
 import pymysql  # noqa: F401  (нужен как драйвер для SQLAlchemy)
-
-# Совместимость sshtunnel со свежим paramiko (>=3.0), где удалён класс DSSKey.
-# Без этого падает с "module 'paramiko' has no attribute 'DSSKey'".
-import paramiko
-if not hasattr(paramiko, "DSSKey"):
-    paramiko.DSSKey = paramiko.RSAKey
 
 # Загрузка переменных окружения из .env (если файл присутствует)
 try:
@@ -54,6 +47,7 @@ if os.environ.get("BITRIX_LIB_DIR"):
     sys.path.append(os.environ["BITRIX_LIB_DIR"])
 from bitrix_config import b
 from audit_log import AuditLog
+from db_tunnel import open_db_tunnel  # SSH-туннель или прямое подключение (DB_USE_SSH)
 #from tg_bot import send
 
 # JSONL-журнал вызовов Битрикс для анализа после запуска (создаётся в main)
@@ -111,11 +105,7 @@ class Config:
     # Максимум одновременных запросов к API Битрикс24
     MAX_CONCURRENT = _get_env_int("BITRIX_MAX_CONCURRENT", default=20)
 
-    # SSH туннель
-    SSH_HOST = _get_env("SSH_HOST", required=True)
-    SSH_PORT = _get_env_int("SSH_PORT", default=22)
-    SSH_USERNAME = _get_env("SSH_USERNAME", required=True)
-    SSH_PASSWORD = _get_env("SSH_PASSWORD", required=True)
+    # SSH_* читаются в db_tunnel и нужны только при DB_USE_SSH=1
 
     # База данных
     DB_HOST = _get_env("DB_HOST", default="localhost")
@@ -145,23 +135,11 @@ class DatabaseConnection:
         self.close()
         logger.info("Установка соединения с базой данных")
 
-        # allow_agent=False и host_pkey_directories=[] — сразу парольная авторизация,
-        # без перебора ключей (иначе "publickey failed" и возможные зависания).
-        self.tunnel = SSHTunnelForwarder(
-            (Config.SSH_HOST, Config.SSH_PORT),
-            ssh_username=Config.SSH_USERNAME,
-            ssh_password=Config.SSH_PASSWORD,
-            remote_bind_address=(Config.DB_HOST, Config.DB_PORT),
-            set_keepalive=10,
-            allow_agent=False,
-            host_pkey_directories=[],
-        )
-        self.tunnel.start()
-        logger.info(f"SSH туннель установлен. Локальный порт: {self.tunnel.local_bind_port}")
+        self.tunnel = open_db_tunnel(Config.DB_HOST, Config.DB_PORT, set_keepalive=10)
 
         db_url = (
             f"mysql+pymysql://{Config.DB_USER}:{Config.DB_PASSWORD}"
-            f"@localhost:{self.tunnel.local_bind_port}/{Config.DB_NAME}"
+            f"@{self.tunnel.local_bind_host}:{self.tunnel.local_bind_port}/{Config.DB_NAME}"
         )
         self.engine = create_engine(
             db_url,

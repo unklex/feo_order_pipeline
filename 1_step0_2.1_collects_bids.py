@@ -21,7 +21,7 @@ import os
 import argparse
 from typing import List, Dict, Optional
 
-from sshtunnel import SSHTunnelForwarder
+from db_tunnel import open_db_tunnel, use_ssh  # SSH-туннель или прямое подключение (DB_USE_SSH)
 from gisopvkwebapiparser import GisopvkWebApiParser
 import pandas as pd
 
@@ -98,11 +98,7 @@ def _get_env_int(name, default=None, required=False):
 class Config:
     """Вся конфигурация скрипта, собранная из переменных окружения."""
 
-    # SSH туннель
-    SSH_HOST = _get_env("SSH_HOST", required=True)
-    SSH_PORT = _get_env_int("SSH_PORT", default=22)
-    SSH_USERNAME = _get_env("SSH_USERNAME", required=True)
-    SSH_PASSWORD = _get_env("SSH_PASSWORD", required=True)
+    # SSH_* читаются в db_tunnel и нужны только при DB_USE_SSH=1
 
     # База данных
     DB_HOST = _get_env("DB_HOST", default="localhost")
@@ -146,26 +142,16 @@ class DatabaseConnection:
 
         logger.info("Установка соединения с базой данных")
 
-        # allow_agent=False и host_pkey_directories=[] заставляют paramiko НЕ
-        # пытаться авторизоваться по ключам (ssh-agent и ~/.ssh), а сразу
-        # использовать пароль — иначе возможны "publickey failed" и зависания.
-        self.tunnel = SSHTunnelForwarder(
-            (Config.SSH_HOST, Config.SSH_PORT),
-            ssh_username=Config.SSH_USERNAME,
-            ssh_password=Config.SSH_PASSWORD,
-            remote_bind_address=(Config.DB_HOST, Config.DB_PORT),
+        self.tunnel = open_db_tunnel(
+            Config.DB_HOST, Config.DB_PORT,
             set_keepalive=10,  # keep-alive пакеты каждые 10 секунд
             ssh_config_file=None,
-            allow_agent=False,
-            host_pkey_directories=[],
             compression=True,
         )
-        self.tunnel.start()
-        logger.info(f"SSH туннель установлен с keep-alive=10сек. Локальный порт: {self.tunnel.local_bind_port}")
 
         db_url = (
             f"mysql+pymysql://{Config.DB_USER}:{Config.DB_PASSWORD}"
-            f"@localhost:{self.tunnel.local_bind_port}/{Config.DB_NAME}"
+            f"@{self.tunnel.local_bind_host}:{self.tunnel.local_bind_port}/{Config.DB_NAME}"
         )
         self.engine = create_engine(
             db_url,
@@ -476,7 +462,8 @@ def check_dependencies():
         import pandas as pd
         import pymysql
         from sqlalchemy import create_engine
-        from sshtunnel import SSHTunnelForwarder
+        if use_ssh():
+            from sshtunnel import SSHTunnelForwarder
         logger.info("Основные модули доступны")
 
         try:

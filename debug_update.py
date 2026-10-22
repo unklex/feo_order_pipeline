@@ -15,10 +15,10 @@ vs join по bid_id (правильный), затем сверяет стату
 import os, asyncio, json, logging
 
 from sqlalchemy import create_engine, text
-from sshtunnel import SSHTunnelForwarder
 
 from bitrix_config import b
 from env_config import require_env, env_int  # значения из .env
+from db_tunnel import open_db_tunnel  # SSH-туннель или прямое подключение (DB_USE_SSH)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -28,10 +28,7 @@ BID_ID = 156321                       # ID заявки ФГИС
 STATUS_FIELD = 'ufCrm16_1754900128'   # поле "Текущий статус ФГИС"
 TARGET_VALUE = '551'                  # dates-wait по STATUS_MAP
 
-SSH_HOST = require_env('SSH_ALT_HOST')
-SSH_PORT = env_int('SSH_ALT_PORT', 22)
-SSH_USERNAME = require_env('SSH_ALT_USERNAME')
-SSH_PASSWORD = require_env('SSH_ALT_PASSWORD')
+# SSH_ALT_* читаются в db_tunnel и нужны только при DB_USE_SSH=1
 DB_HOST = os.environ.get('DB_HOST', 'localhost')
 DB_PORT = env_int('DB_PORT', 3306)
 DB_NAME = require_env('DB_NAME')
@@ -57,16 +54,9 @@ async def main():
     logger.info(f"ШАГ 1: Маппинг bid_id={BID_ID} в БД")
     logger.info("=" * 60)
 
-    tunnel = SSHTunnelForwarder(
-        (SSH_HOST, SSH_PORT),
-        ssh_username=SSH_USERNAME, ssh_password=SSH_PASSWORD,
-        # Только пароль: без перебора ключей из ~/.ssh и ssh-agent (иначе fail2ban банит IP на 7 дней)
-        allow_agent=False, host_pkey_directories=[],
-        remote_bind_address=('localhost', 3306)
-    )
-    tunnel.start()
+    tunnel = open_db_tunnel(DB_HOST, DB_PORT, prefix="SSH_ALT")
     engine = create_engine(
-        f'mysql+pymysql://{DB_USER}:{DB_PASSWORD}@localhost:{tunnel.local_bind_port}/{DB_NAME}'
+        f'mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{tunnel.local_bind_host}:{tunnel.local_bind_port}/{DB_NAME}'
     )
 
     try:

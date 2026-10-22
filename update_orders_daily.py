@@ -37,7 +37,6 @@ from pathlib import Path
 
 import pandas as pd
 from sqlalchemy import create_engine
-from sshtunnel import SSHTunnelForwarder
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
@@ -45,6 +44,7 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 from bitrix_config import b
 from env_config import require_env, env_int  # значения из .env
 from audit_log import AuditLog
+from db_tunnel import open_db_tunnel  # SSH-туннель или прямое подключение (DB_USE_SSH)
 
 # JSONL-журнал вызовов Битрикс для анализа после запуска (создаётся в main)
 audit = None
@@ -76,11 +76,7 @@ def find_latest_full_export(directory=None):
             candidates.append((m.group(1) + m.group(2), f))
     return max(candidates)[1] if candidates else None
 
-# SSH-туннель
-SSH_HOST = require_env('SSH_ALT_HOST')
-SSH_PORT = env_int('SSH_ALT_PORT', 22)
-SSH_USERNAME = require_env('SSH_ALT_USERNAME')
-SSH_PASSWORD = require_env('SSH_ALT_PASSWORD')
+# SSH-туннель: второй шлюз SSH_ALT_* (читается в db_tunnel, нужен только при DB_USE_SSH=1)
 
 # База данных
 DB_HOST = os.environ.get('DB_HOST', 'localhost')
@@ -148,21 +144,11 @@ for _noisy in ('fast_bitrix24', 'paramiko', 'sshtunnel', 'asyncio', 'urllib3'):
 # =============================================================================
 
 def create_db_engine_through_ssh():
-    """Создаёт подключение к MariaDB через SSH-туннель."""
-    tunnel = SSHTunnelForwarder(
-        (SSH_HOST, SSH_PORT),
-        ssh_username=SSH_USERNAME,
-        ssh_password=SSH_PASSWORD,
-        # Только пароль: без перебора ключей из ~/.ssh и ssh-agent. Каждый отклонённый ключ -
-        # это неудачный вход для fail2ban, и IP банится на 7 дней уже с первой попытки.
-        allow_agent=False,
-        host_pkey_directories=[],
-        remote_bind_address=(DB_HOST, DB_PORT)
-    )
-    tunnel.start()
+    """Создаёт подключение к MariaDB через SSH-туннель (или напрямую при DB_USE_SSH=0)."""
+    tunnel = open_db_tunnel(DB_HOST, DB_PORT, prefix="SSH_ALT")
 
     engine = create_engine(
-        f'mysql+pymysql://{DB_USER}:{DB_PASSWORD}@localhost:{tunnel.local_bind_port}/{DB_NAME}',
+        f'mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{tunnel.local_bind_host}:{tunnel.local_bind_port}/{DB_NAME}',
         echo=False
     )
 

@@ -22,10 +22,10 @@ from datetime import datetime
 from pandas import json_normalize
 
 from sqlalchemy import create_engine, text
-from sshtunnel import SSHTunnelForwarder, BaseSSHTunnelForwarderError
 import pymysql
 
 from audit_log import AuditLog
+from db_tunnel import open_db_tunnel, use_ssh  # SSH-туннель или прямое подключение (DB_USE_SSH)
 
 # JSONL-журнал итогов по архивам для анализа после запуска (создаётся в main)
 audit = None
@@ -63,15 +63,8 @@ def _require_env(name: str) -> str:
     return value
 
 
-SSH_HOST = _require_env('SSH_HOST')
-SSH_PORT = int(os.environ.get('SSH_PORT', '22'))
-SSH_USERNAME = _require_env('SSH_USERNAME')
-# Вход по ключу (приоритетнее пароля): SSH_KEY_PATH - путь к приватному ключу,
-# SSH_KEY_PASSPHRASE - парольная фраза ключа (если есть). Иначе используется SSH_PASSWORD.
-SSH_KEY_PATH = os.environ.get('SSH_KEY_PATH') or None
-SSH_KEY_PASSPHRASE = os.environ.get('SSH_KEY_PASSPHRASE') or None
-SSH_PASSWORD = os.environ.get('SSH_PASSWORD') if SSH_KEY_PATH else _require_env('SSH_PASSWORD')
-
+# SSH_* (в т.ч. вход по ключу SSH_KEY_PATH / SSH_KEY_PASSPHRASE) читаются в db_tunnel
+# и нужны только при DB_USE_SSH=1.
 DB_HOST = os.environ.get('DB_HOST', 'localhost')
 DB_PORT = int(os.environ.get('DB_PORT', '3306'))
 DB_NAME = _require_env('DB_NAME')
@@ -515,43 +508,25 @@ def main():
     audit = AuditLog("import_to_db")
     logger.info(f"Журнал итогов (JSONL): {audit.path}")
 
-    # Создание SSH-туннеля
-    logger.info("Создание SSH-туннеля")
-    if SSH_KEY_PATH:
-        logger.info(f"Аутентификация по ключу: {SSH_KEY_PATH}")
-        ssh_auth = {'ssh_pkey': SSH_KEY_PATH, 'ssh_private_key_password': SSH_KEY_PASSPHRASE}
-    else:
-        logger.info("Аутентификация по паролю")
-        ssh_auth = {'ssh_password': SSH_PASSWORD}
-
-    tunnel = SSHTunnelForwarder(
-        (SSH_HOST, SSH_PORT),
-        ssh_username=SSH_USERNAME,
-        **ssh_auth,
-        allow_agent=False,
-        host_pkey_directories=[],  # не перебирать ключи из ~/.ssh автоматически
-        remote_bind_address=(DB_HOST, DB_PORT),
-        set_keepalive=30.0  # keepalive-пакет каждые 30 с, чтобы туннель не рвался при долгом импорте
-    )
-
+    tunnel = None
     try:
-        # Запуск туннеля
+        # SSH-туннель (или прямое подключение при DB_USE_SSH=0)
         try:
-            tunnel.start()
-        except BaseSSHTunnelForwarderError as e:
+            # keepalive-пакет каждые 30 с, чтобы туннель не рвался при долгом импорте
+            tunnel = open_db_tunnel(DB_HOST, DB_PORT, set_keepalive=30.0)
+        except Exception as e:
             msg = (
-                f"Не удалось подключиться к SSH-шлюзу {SSH_HOST}:{SSH_PORT}: {e}. "
+                f"Не удалось подключиться к SSH-шлюзу {os.environ.get('SSH_HOST')}:{os.environ.get('SSH_PORT', 22)}: {e}. "
                 "Проверьте: доступность порта (Test-NetConnection), VPN, "
                 "разрешён ли ваш IP на сервере, запущен ли sshd, логин/пароль."
             )
             logger.error(msg)
             print(f"\n{msg}")
             return 1
-        logger.info(f"SSH-туннель создан. Локальный порт: {tunnel.local_bind_port}")
 
         # Создание подключения к базе данных
         engine = create_engine(
-            f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@localhost:{tunnel.local_bind_port}/{DB_NAME}",
+            f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{tunnel.local_bind_host}:{tunnel.local_bind_port}/{DB_NAME}",
             echo=False
         )
 
@@ -615,8 +590,9 @@ def main():
 
     finally:
         # Закрытие SSH-туннеля
-        if 'tunnel' in locals() and tunnel.is_active:
-            logger.info("Закрытие SSH-туннеля")
+        if tunnel is not None and tunnel.is_active:
+            if use_ssh():
+                logger.info("Закрытие SSH-туннеля")
             tunnel.stop()
         audit.close()
 
