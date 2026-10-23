@@ -72,7 +72,7 @@ def _audit(event, **data):
 # Без --json обрабатываются все ожидающие batch_*.json из папки проекта (их пишет
 # 1_step0_2.1_collects_bids.py); файл, все заявки которого заполнены, переносится в archive/.
 from db_tunnel import use_ssh
-from pipeline_common import ROOT, archive_file, pending_batch_files
+from pipeline_common import EXIT_PARTIAL, ROOT, archive_file, pending_batch_files
 
 
 # ---------------------------------------------------------------------------
@@ -500,17 +500,16 @@ async def get_region_map() -> dict:
             'IBLOCK_ID': REGIONS_LIST_ID,
         })
         if not data:
-            logger.warning("Не получены данные о регионах из Битрикс24")
-            return {}
+            raise RuntimeError("пустой ответ")
         df = pd.DataFrame(data)
         if not {'ID', 'NAME'}.issubset(df.columns):
-            logger.warning("В списке регионов нет колонок ID/NAME")
-            return {}
+            raise RuntimeError("в списке нет колонок ID/NAME")
         logger.info(f"Получено регионов: {len(df)}")
         return df.set_index('NAME')['ID'].to_dict()
     except Exception as e:
-        logger.error(f"Ошибка при получении списка регионов: {e}")
-        return {}
+        # Без справочника карточки заполнились бы без регионов и были бы отмечены
+        # заполненными навсегда — останавливаем запуск, чтобы он повторился
+        raise RuntimeError(f"Не получен список регионов из Битрикс24: {e}") from e
 
 
 async def get_fkko_map() -> dict:
@@ -521,27 +520,26 @@ async def get_fkko_map() -> dict:
             'select': ['id', FKKO_FIELD_CODE],
         })
         if not data:
-            logger.warning("Не получены данные ФККО из Битрикс24")
-            return {}
+            raise RuntimeError("пустой ответ")
         fkko = pd.DataFrame(data)
         fkko = fkko[fkko[FKKO_FIELD_CODE].notna()]
         fkko[FKKO_FIELD_CODE] = fkko[FKKO_FIELD_CODE].astype(float).astype(int).astype(str)
         logger.info(f"Получено записей ФККО: {len(fkko)}")
         return fkko.set_index(FKKO_FIELD_CODE)['id'].to_dict()
     except Exception as e:
-        logger.error(f"Ошибка при получении ФККО: {e}")
-        return {}
+        raise RuntimeError(f"Не получен справочник ФККО из Битрикс24: {e}") from e
 
 
-async def import_companies_to_bitrix(db: DatabaseConnection, missing_ids) -> int:
+async def import_companies_to_bitrix(db: DatabaseConnection, missing_ids) -> tuple:
     """
     Импортирует компании из organization_info в Битрикс24 по списку ID.
     Обновляет bx_co_id в БД и сохраняет отчёт в Excel.
+    Возвращает (добавлено, ошибок).
     """
     missing_ids = list(missing_ids)
     if not missing_ids:
         logger.info("Список missing_ids пуст — нет компаний для импорта")
-        return 0
+        return 0, 0
 
     def fetch(engine):
         query = """
@@ -552,14 +550,17 @@ async def import_companies_to_bitrix(db: DatabaseConnection, missing_ids) -> int
         """
         return pd.read_sql(text(query), engine, params={"ids": tuple(missing_ids)})
 
-    df = db.run(fetch, description="выборка компаний для импорта", default=pd.DataFrame())
+    df = db.run(fetch, description="выборка компаний для импорта")
+    if df is None:
+        raise RuntimeError("Не удалось прочитать organization_info")
     if df.empty:
         logger.info("Нет новых компаний для импорта в Битрикс24")
-        return 0
+        return 0, 0
 
     logger.info(f"Найдено {len(df)} компаний для импорта в Битрикс24")
 
     added_companies_count = 0
+    failed_count = 0
     imported_companies = []
 
     for _, row in df.iterrows():
@@ -594,15 +595,22 @@ async def import_companies_to_bitrix(db: DatabaseConnection, missing_ids) -> int
                         )
                     return True
 
-                db.run(do_update, description=f"обновление bx_co_id для {company_id}", default=False)
+                if not db.run(do_update, description=f"обновление bx_co_id для {company_id}", default=False):
+                    # Компания в Битрикс есть, но без bx_co_id в БД следующий запуск создаст дубль
+                    failed_count += 1
+                    logger.error(f"[X] Компания {name_short} -> {result} создана, но bx_co_id не записан в БД")
+                    _audit("company_db_update_failed", org_id=company_id, bitrix_company_id=result)
 
                 imported_companies.append({'name_short': name_short, 'bitrix_id': result})
                 added_companies_count += 1
                 logger.info(f"[+] Добавлена: {name_short} -> Битрикс ID {result}")
+            else:
+                failed_count += 1
 
         except Exception as e:
             logger.error(f"[X] Ошибка при добавлении ID {company_id}: {e}")
             _audit("company_add", org_id=company_id, name_short=name_short, ok=False, error=str(e))
+            failed_count += 1
 
     if imported_companies:
         try:
@@ -611,8 +619,8 @@ async def import_companies_to_bitrix(db: DatabaseConnection, missing_ids) -> int
         except Exception as e:
             logger.warning(f"Не удалось сохранить отчёт Excel: {e}")
 
-    logger.info(f"Всего добавлено компаний: {added_companies_count}")
-    return added_companies_count
+    logger.info(f"Всего добавлено компаний: {added_companies_count}, ошибок: {failed_count}")
+    return added_companies_count, failed_count
 
 
 # ---------------------------------------------------------------------------
@@ -843,7 +851,10 @@ def read_orders(db: DatabaseConnection) -> pd.DataFrame:
     def op(engine):
         query = "SELECT * FROM new_webapi_orders_transportation WHERE is_active = 1 AND parsed = 1 AND bitrix_filled = 0"
         return pd.read_sql(query, engine)
-    return db.run(op, description="выборка заказов к заполнению", default=pd.DataFrame())
+    df = db.run(op, description="выборка заказов к заполнению")
+    if df is None:
+        raise RuntimeError("Не удалось прочитать заказы к заполнению из БД")
+    return df
 
 
 def read_companies(db: DatabaseConnection) -> pd.DataFrame:
@@ -855,17 +866,22 @@ def read_companies(db: DatabaseConnection) -> pd.DataFrame:
         WHERE bx_co_id IS NOT NULL
         """
         return pd.read_sql(query, engine)
-    return db.run(op, description="выборка компаний", default=pd.DataFrame())
+    df = db.run(op, description="выборка компаний")
+    if df is None:
+        # Пустой результат здесь означал бы «все компании недостающие» и их повторное создание
+        raise RuntimeError("Не удалось прочитать organization_info из БД")
+    return df
 
 
 # ---------------------------------------------------------------------------
 # Основной пайплайн
 # ---------------------------------------------------------------------------
-async def run_pipeline(db: DatabaseConnection, data: list, max_concurrent: int):
+async def run_pipeline(db: DatabaseConnection, data: list, max_concurrent: int) -> int:
+    """Возвращает число ошибок (карточки и компании); 0 — всё прошло."""
     # 1. JSON -> df_merged
     if not data:
         logger.info("JSON пуст — нечего обрабатывать")
-        return
+        return 0
     df_merged = build_merged_dataframe(data)
 
     # 2. Заказы из БД
@@ -873,7 +889,7 @@ async def run_pipeline(db: DatabaseConnection, data: list, max_concurrent: int):
     logger.info(f"Заказов к заполнению (bitrix_filled=0): {len(orders)}")
     if orders.empty:
         logger.info("Нет заказов к заполнению — выход")
-        return
+        return 0
 
     # 3. Объединение JSON + заказы
     orders['bid_id'] = _id_str(orders['bid_id'])
@@ -928,8 +944,9 @@ async def run_pipeline(db: DatabaseConnection, data: list, max_concurrent: int):
     missing_ids = set(ids_to_check) - set(oi_ids)
     logger.info(f"Недостающих компаний для импорта: {len(missing_ids)}")
 
+    company_errors = 0
     if missing_ids:
-        await import_companies_to_bitrix(db, [int(x) for x in missing_ids])
+        _, company_errors = await import_companies_to_bitrix(db, [int(x) for x in missing_ids])
         bot = read_companies(db)  # перечитываем после импорта
 
     # 8. Приклеиваем утилизатора (executor_recycling) и отходообразователя (organization)
@@ -1002,8 +1019,9 @@ async def run_pipeline(db: DatabaseConnection, data: list, max_concurrent: int):
     marked = mark_orders_filled(db, result.get('successful_item_ids', []))
 
     _audit("run_summary", json_records=len(data), orders_to_fill=len(orders),
-           rows_to_update=len(df_joined), marked_filled=marked,
+           rows_to_update=len(df_joined), marked_filled=marked, company_errors=company_errors,
            **{k: v for k, v in result.items() if k != 'successful_item_ids'})
+    return result['error_count'] + company_errors
 
 
 async def main_async(args) -> int:
@@ -1021,9 +1039,12 @@ async def main_async(args) -> int:
         db.reconnect()
         data, bids_by_file = load_batch_files(json_files)
         _audit("input_files", files={os.path.basename(f): len(b) for f, b in bids_by_file.items()})
-        await run_pipeline(db, data, args.max_concurrent)
+        errors = await run_pipeline(db, data, args.max_concurrent)
         if not args.no_archive:
             archive_finished_files(db, bids_by_file)
+        if errors:
+            logger.error(f"Запуск завершён с ошибками: {errors}")
+            return EXIT_PARTIAL
         return 0
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}")

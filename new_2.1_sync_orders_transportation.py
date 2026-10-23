@@ -5,9 +5,11 @@
 Упрощенный скрипт для создания заказов в Битрикс24 из таблицы new_webapi_orders_transportation.
 
 Процесс работы:
-1. Получает заказы из БД где bitrix_id IS NULL
-2. Запрашивает подтверждение на создание
-3. Создает пустые заказы в Битрикс24 и обновляет bitrix_id в БД
+1. Получает заказы из БД, где bitrix_id IS NULL (bid_id и bitrix_id в таблице уникальны)
+2. Ищет в Битрикс карточку по полю «номер заявки»: она остаётся, если прошлый запуск
+   создал карточку, но не успел записать её id в БД — такую привязываем, а не создаём заново
+3. Запрашивает подтверждение и создаёт карточки с номером заявки;
+   bitrix_id записывается в БД сразу после создания каждой карточки
 
 Особенности:
 - Все секреты вынесены в переменные окружения / .env (см. .env.example).
@@ -48,7 +50,7 @@ if os.environ.get("BITRIX_LIB_DIR"):
     sys.path.append(os.environ["BITRIX_LIB_DIR"])
 from bitrix_config import b
 from audit_log import AuditLog
-from pipeline_common import noninteractive
+from pipeline_common import EXIT_PARTIAL, noninteractive
 from db_tunnel import open_db_tunnel, use_ssh  # SSH-туннель или прямое подключение (DB_USE_SSH)
 #from tg_bot import send
 
@@ -103,6 +105,9 @@ class Config:
 
     # ID смарт-процесса ФЭО в Битрикс24
     ENTITY_TYPE_ID = _get_env_int("BITRIX_ENTITY_TYPE_ID", default=137)
+
+    # Поле карточки «Номер заявки» (по нему карточка находится со стороны Битрикс)
+    BID_FIELD = "ufCrm16_1694076789"
 
     # Максимум одновременных запросов к API Битрикс24
     MAX_CONCURRENT = _get_env_int("BITRIX_MAX_CONCURRENT", default=20)
@@ -235,14 +240,17 @@ class DatabaseConnection:
 
 
 def get_orders_without_bitrix_id(db: DatabaseConnection):
-    """Получает все заказы из БД, где bitrix_id не заполнен. Переподключается при обрыве."""
+    """Получает все заказы из БД, где bitrix_id не заполнен. Переподключается при обрыве.
+
+    Возвращает None при ошибке БД — это не то же самое, что «нечего создавать».
+    """
     logger.info("Получение заказов из БД где bitrix_id IS NULL")
 
     def op(engine):
         query = """
         SELECT bid_id, parsed, parsed_at
         FROM new_webapi_orders_transportation
-        WHERE bitrix_id IS NULL
+        WHERE bitrix_id IS NULL AND bid_id IS NOT NULL
         ORDER BY parsed_at ASC
         """
         with engine.connect() as conn:
@@ -255,8 +263,26 @@ def get_orders_without_bitrix_id(db: DatabaseConnection):
         logger.info("Все заказы в БД уже имеют bitrix_id")
         return pd.DataFrame(columns=['bid_id', 'parsed', 'parsed_at'])
 
-    return db.run(op, description="получение заказов без bitrix_id",
-                  default=pd.DataFrame(columns=['bid_id', 'parsed', 'parsed_at']))
+    return db.run(op, description="получение заказов без bitrix_id")
+
+
+async def find_existing_cards(b, bid_ids, entity_type_id):
+    """{bid_id: bitrix_id} для карточек, у которых уже заполнен номер заявки."""
+    found = {}
+    chunk = 50
+    for i in range(0, len(bid_ids), chunk):
+        wanted = set(bid_ids[i:i + chunk])
+        items = await b.get_all('crm.item.list', {
+            'entityTypeId': entity_type_id,
+            'filter': {Config.BID_FIELD: sorted(wanted)},
+            'select': ['id', Config.BID_FIELD],
+        })
+        for item in items or []:
+            bid = str(item.get(Config.BID_FIELD) or '').strip()
+            # Проверяем сами: если фильтр не сработает, чужие карточки не привяжутся
+            if bid in wanted and bid not in found:
+                found[bid] = item['id']
+    return found
 
 
 def update_bitrix_id_in_db(db: DatabaseConnection, bid_id, bitrix_id):
@@ -276,11 +302,15 @@ def update_bitrix_id_in_db(db: DatabaseConnection, bid_id, bitrix_id):
     return db.run(op, description=f"обновление bitrix_id для bid_id {bid_id}", default=False)
 
 
-async def create_orders_in_bitrix_async(b, orders_to_create, entity_type_id, max_concurrent=20):
-    """Асинхронно создает пустые заказы в Битрикс24."""
+async def create_orders_in_bitrix_async(b, db, orders_to_create, entity_type_id, max_concurrent=20):
+    """Асинхронно создает карточки (с номером заявки) и сразу пишет их id в БД.
+
+    Возвращает (created, errors, db_failed): created — [{'bid_id', 'bitrix_id'}].
+    """
     success_count = 0
     error_count = 0
     created_orders = []
+    db_failed = []
 
     pbar = tqdm(total=len(orders_to_create), desc="Создание заказов в Битрикс24")
     start_time = time.time()
@@ -291,7 +321,8 @@ async def create_orders_in_bitrix_async(b, orders_to_create, entity_type_id, max
 
         async with semaphore:
             try:
-                fields = {}  # Пустые поля - создаем минимальную заглушку
+                # Номер заявки — чтобы карточку можно было найти, если id не попадёт в БД
+                fields = {Config.BID_FIELD: row['bid_id']}
 
                 result = await b.call('crm.item.add', {
                     'entityTypeId': entity_type_id,
@@ -303,6 +334,10 @@ async def create_orders_in_bitrix_async(b, orders_to_create, entity_type_id, max
                     created_orders.append({'bid_id': row['bid_id'], 'bitrix_id': created_id})
                     success_count += 1
                     _audit("item_add", bid_id=row['bid_id'], ok=True, item_id=created_id)
+                    # Сразу в БД: при обрыве посреди запуска не останется карточек без связи
+                    if not update_bitrix_id_in_db(db, row['bid_id'], created_id):
+                        db_failed.append(row['bid_id'])
+                        _audit("db_update_failed", bid_id=row['bid_id'], item_id=created_id)
                     return True, created_id
                 else:
                     logger.error(f"Неожиданный ответ API при создании заказа {row['bid_id']}")
@@ -331,11 +366,11 @@ async def create_orders_in_bitrix_async(b, orders_to_create, entity_type_id, max
     total_time = time.time() - start_time
     logger.info(f"Создание заказов завершено: {success_count} успешно, {error_count} ошибок за {total_time:.2f}с")
 
-    return created_orders
+    return created_orders, error_count, db_failed
 
 
-def create_orders_in_bitrix(b, orders_to_create, entity_type_id=None, max_concurrent=None):
-    """Обертка для асинхронного создания заказов в Битрикс24."""
+def create_orders_in_bitrix(b, db, orders_to_create, entity_type_id=None, max_concurrent=None):
+    """Обертка для асинхронного создания заказов в Битрикс24. См. create_orders_in_bitrix_async."""
     if entity_type_id is None:
         entity_type_id = Config.ENTITY_TYPE_ID
     if max_concurrent is None:
@@ -343,33 +378,23 @@ def create_orders_in_bitrix(b, orders_to_create, entity_type_id=None, max_concur
 
     if orders_to_create.empty:
         logger.info("Нет заказов для создания в Битрикс24")
-        return []
+        return [], 0, []
 
-    logger.info(f"Создание {len(orders_to_create)} пустых заказов в Битрикс24")
-
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        created_orders = loop.run_until_complete(
-            create_orders_in_bitrix_async(b, orders_to_create, entity_type_id, max_concurrent)
-        )
-        loop.close()
-        return created_orders
-
-    except Exception as e:
-        logger.error(f"Ошибка при создании заказов в Битрикс24: {e}")
-        logger.debug(traceback.format_exc())
-        return []
+    logger.info(f"Создание {len(orders_to_create)} карточек в Битрикс24")
+    return asyncio.run(
+        create_orders_in_bitrix_async(b, db, orders_to_create, entity_type_id, max_concurrent)
+    )
 
 
 def main() -> int:
-    """Код выхода: 0 — успех или нечего создавать, 1 — ошибка.
+    """Код выхода: 0 — успех или нечего создавать, EXIT_PARTIAL — часть карточек не создана
+    или не записана в БД, 1 — ошибка.
 
     --yes (или FEO_NONINTERACTIVE=1) — создавать без подтверждения в консоли.
     """
     """Основная функция скрипта создания заказов в Битрикс24"""
     global audit
-    ap = argparse.ArgumentParser(description="Создание пустых карточек СП ФЭО в Битрикс24 для заказов без bitrix_id.")
+    ap = argparse.ArgumentParser(description="Создание карточек СП ФЭО в Битрикс24 для заявок без bitrix_id.")
     ap.add_argument("--yes", action="store_true", help="Не спрашивать подтверждение.")
     args = ap.parse_args()
     logger.info("Запуск упрощенного скрипта создания заказов в Битрикс24")
@@ -386,10 +411,25 @@ def main() -> int:
         logger.info("=" * 60)
         logger.info("Получение заказов из БД без bitrix_id")
         db_orders = get_orders_without_bitrix_id(db)
+        if db_orders is None:
+            logger.error("Не удалось прочитать заказы из БД")
+            return 1
+
+        # Карточки, созданные прошлым запуском, id которых не попал в БД
+        if not db_orders.empty:
+            found = asyncio.run(find_existing_cards(b, db_orders['bid_id'].tolist(), Config.ENTITY_TYPE_ID))
+            for bid_id, item_id in found.items():
+                if not update_bitrix_id_in_db(db, bid_id, item_id):
+                    logger.error(f"Не удалось записать найденную карточку {item_id} для заявки {bid_id}")
+                    return 1
+                _audit("item_found", bid_id=bid_id, item_id=item_id)
+            if found:
+                logger.info(f"Найдено в Битрикс и привязано карточек: {len(found)}")
+                db_orders = db_orders[~db_orders['bid_id'].isin(found)]
 
         print("\n" + "=" * 60)
         print("СТАТИСТИКА:")
-        print(f"• Заказов в БД без bitrix_id: {len(db_orders)}")
+        print(f"• Заявок без карточки в Битрикс: {len(db_orders)}")
         print("=" * 60)
 
         if db_orders.empty:
@@ -397,7 +437,7 @@ def main() -> int:
             #send("Скрипт завершен: нет заказов для создания в Битрикс24")
             return 0
 
-        print(f"\nБУДЕТ СОЗДАНО {len(db_orders)} ПУСТЫХ ЗАКАЗОВ В БИТРИКС24")
+        print(f"\nБУДЕТ СОЗДАНО {len(db_orders)} КАРТОЧЕК В БИТРИКС24")
         print("Примеры bid_id для создания:", db_orders['bid_id'].head(10).tolist())
 
         if not db_orders.empty and 'parsed_at' in db_orders.columns:
@@ -411,38 +451,21 @@ def main() -> int:
         # Создаем заказы в Битрикс24
         logger.info("=" * 60)
         logger.info("Создание заказов в Битрикс24")
-        created_orders = create_orders_in_bitrix(
-            b, db_orders, Config.ENTITY_TYPE_ID, max_concurrent=Config.MAX_CONCURRENT
+        created_orders, error_count, failed_updates = create_orders_in_bitrix(
+            b, db, db_orders, Config.ENTITY_TYPE_ID, max_concurrent=Config.MAX_CONCURRENT
         )
-
-        if not created_orders:
-            logger.error("Не удалось создать ни одного заказа")
-            #send("Ошибка: не удалось создать ни одного заказа в Битрикс24")
-            return 1
-
-        # Обновляем bitrix_id в БД для созданных заказов (с авто-reconnect)
-        logger.info("=" * 60)
-        logger.info("Обновление bitrix_id в БД")
-        updated_count = 0
-        failed_updates = []
-
-        for created_order in created_orders:
-            if update_bitrix_id_in_db(db, created_order['bid_id'], created_order['bitrix_id']):
-                updated_count += 1
-            else:
-                failed_updates.append(created_order['bid_id'])
-                # Элемент в Битрикс создан, но id не записан в БД — при следующем запуске будет дубль
-                _audit("db_update_failed", bid_id=created_order['bid_id'], item_id=created_order['bitrix_id'])
 
         message = (
             f"Создание заказов в Битрикс24 завершено:\n"
-            f"• Найдено заказов в БД без bitrix_id: {len(db_orders)}\n"
+            f"• Заявок без карточки: {len(db_orders)}\n"
             f"• Успешно создано в Битрикс24: {len(created_orders)}\n"
-            f"• Обновлено bitrix_id в БД: {updated_count}"
+            f"• Ошибок создания: {error_count}\n"
+            f"• Записано bitrix_id в БД: {len(created_orders) - len(failed_updates)}"
         )
         if failed_updates:
-            message += f"\n• Ошибки обновления БД: {len(failed_updates)}"
-            logger.warning(f"Не удалось обновить bitrix_id для: {failed_updates}")
+            message += (f"\n• Ошибки записи в БД: {len(failed_updates)} "
+                        f"(карточка найдётся по номеру заявки при следующем запуске)")
+            logger.warning(f"Не удалось записать bitrix_id для: {failed_updates}")
 
         print("\n" + "=" * 60)
         print("ИТОГОВЫЙ ОТЧЕТ:")
@@ -451,9 +474,9 @@ def main() -> int:
 
         logger.info(message.replace("\n", " | "))
         _audit("run_summary", without_bitrix_id=len(db_orders), created=len(created_orders),
-               db_updated=updated_count, db_update_failed=len(failed_updates))
+               create_errors=error_count, db_update_failed=len(failed_updates))
         #send(message)
-        return 1 if failed_updates else 0
+        return EXIT_PARTIAL if (error_count or failed_updates) else 0
 
     except Exception as e:
         error_message = f"Критическая ошибка в скрипте создания заказов: {e}"

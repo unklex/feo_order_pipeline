@@ -10,6 +10,8 @@
 ARCHIVE_KEEP_DAYS (по умолчанию 30) дней удаляются.
 
 Код выхода: 0 — успех, 3 — нужен вход в ФГИС (python login_fgis.py), 1 — ошибка шага.
+Шаг с кодом 4 (выполнен, но часть элементов с ошибками) не останавливает сценарий:
+следующие шаги выполняются, а весь запуск завершается с кодом 1.
 """
 
 import argparse
@@ -23,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 import env_config  # noqa: F401  (подгружает .env: ARCHIVE_KEEP_DAYS и др.)
-from pipeline_common import (ROOT, EXIT_AUTH_REQUIRED, archive_export, archive_file, export_time,
+from pipeline_common import (ROOT, EXIT_AUTH_REQUIRED, EXIT_PARTIAL, archive_export, archive_file, export_time,
                              full_exports, latest_full_export, pid_alive, purge_archive)
 
 LOG_DIR = Path(os.environ.get("LOG_DIR") or ROOT / "logs")
@@ -37,11 +39,13 @@ STEPS = {
     "collect": ("Загрузка заявок из ФГИС", "1_step0_2.1_collects_bids.py", lambda export: ["--include-unfilled"]),
     "fill": ("Заполнение карточек в Битрикс24", "fill db.py", lambda export: []),
     "statuses": ("Обновление статусов в Битрикс24", "update_orders_daily.py", lambda export: [str(export)]),
+    "history": ("История статусов в БД", "status_history.py", lambda export: [str(export)]),
 }
 
 SCENARIOS = {
-    "add": ("Добавить и заполнить новые заказы", ["download", "import", "sync", "collect", "fill", "statuses"]),
-    "statuses": ("Обновить статусы", ["download", "statuses"]),
+    "add": ("Добавить и заполнить новые заказы",
+            ["download", "import", "sync", "collect", "fill", "statuses", "history"]),
+    "statuses": ("Обновить статусы", ["download", "statuses", "history"]),
 }
 
 
@@ -139,10 +143,11 @@ class Run:
                 last_save = time.time()
                 self.save()
         rc = proc.wait()
-        ok = rc == 0
-        step.update(status="ok" if ok else "failed", rc=rc, finished=datetime.now().isoformat(timespec="seconds"))
+        status = "ok" if rc == 0 else "errors" if rc == EXIT_PARTIAL else "failed"
+        step.update(status=status, rc=rc, finished=datetime.now().isoformat(timespec="seconds"))
         self.save()
-        self.echo(f"----- {title}: {'готово' if ok else f'ошибка (код {rc})'} -----")
+        result = {"ok": "готово", "errors": "готово с ошибками"}.get(status, f"ошибка (код {rc})")
+        self.echo(f"----- {title}: {result} -----")
         return rc
 
     def finish(self, status: str, message: str):
@@ -190,13 +195,16 @@ def main() -> int:
         run.echo(f"Используется последняя выгрузка: {export.name} ({export_time(export):%d.%m.%Y %H:%M})")
         run.state["export"] = export.name
 
+    partial = []
     for step in run.state["steps"]:
         started = time.time()
         rc = run.run_step(step, export)
         if rc == EXIT_AUTH_REQUIRED:
             run.finish("auth_required", "Нужен вход в ФГИС: нажмите «Войти в ФГИС» (или python login_fgis.py)")
             return EXIT_AUTH_REQUIRED
-        if rc != 0:
+        if rc == EXIT_PARTIAL:
+            partial.append(step["title"])
+        elif rc != 0:
             run.finish("failed", f"Ошибка на шаге «{step['title']}» — подробности в журнале выше")
             return 1
         if step["key"] == "download":
@@ -213,6 +221,10 @@ def main() -> int:
         run.echo(f"В архив перенесено файлов: {len(moved)}")
     if removed:
         run.echo(f"Удалены старые папки архива: {[p.name for p in removed]}")
+    if partial:
+        run.finish("failed", "Готово, но с ошибками на шагах: " + ", ".join(f"«{t}»" for t in partial)
+                   + " — подробности в журнале выше и во вкладке «Журнал Битрикс»")
+        return 1
     run.finish("ok", "Готово")
     return 0
 

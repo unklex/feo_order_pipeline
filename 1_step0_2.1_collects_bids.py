@@ -23,7 +23,7 @@ import sys
 from typing import List, Dict, Optional
 
 from db_tunnel import open_db_tunnel, use_ssh  # SSH-туннель или прямое подключение (DB_USE_SSH)
-from pipeline_common import EXIT_AUTH_REQUIRED, AuthRequired, pending_batch_files
+from pipeline_common import EXIT_AUTH_REQUIRED, EXIT_PARTIAL, AuthRequired, pending_batch_files
 from gisopvkwebapiparser import GisopvkWebApiParser
 import pandas as pd
 
@@ -319,7 +319,10 @@ def get_ids_to_parse(db: DatabaseConnection, max_ids: int = 1000, include_unfill
         logger.info(f"Получено {len(ids)} bid_id для обработки")
         return ids
 
-    ids = db.run(op, description="получение списка bid_id", default=[])
+    ids = db.run(op, description="получение списка bid_id")
+    if ids is None:
+        # Пустой список выглядел бы как «нечего загружать»
+        raise RuntimeError("Не удалось получить из БД список заявок для загрузки")
 
     if include_unfilled:
         def op_unfilled(engine):
@@ -333,8 +336,10 @@ def get_ids_to_parse(db: DatabaseConnection, max_ids: int = 1000, include_unfill
                 return [str(row[0]) for row in conn.execute(text(query)).fetchall()]
 
         in_files = _bids_in_pending_files()
-        stuck = [b for b in db.run(op_unfilled, description="получение зависших bid_id", default=[])
-                 if b not in in_files and b not in ids]
+        unfilled = db.run(op_unfilled, description="получение зависших bid_id")
+        if unfilled is None:
+            raise RuntimeError("Не удалось получить из БД список зависших заявок")
+        stuck = [b for b in unfilled if b not in in_files and b not in ids]
         if stuck:
             logger.info(f"Зависших заявок (распарсены, но не заполнены, файла нет): {len(stuck)} — запрашиваем заново")
         ids = ids + stuck[:max(0, max_ids - len(ids))]
@@ -695,14 +700,14 @@ def main(argv=None):
                 logger.warning(f"Ошибка при восстановлении: {e}")
 
         # Основная обработка с батчами
-        process_orders_in_batches(
+        errors = process_orders_in_batches(
             db, parser,
             ids_to_parse=explicit_ids,
             mark_in_db=mark_in_db,
             max_ids=args.max_ids,
             include_unfilled=args.include_unfilled,
         )
-        exit_code = 0
+        exit_code = EXIT_PARTIAL if errors else 0
 
     except AuthRequired as e:
         logger.error(f"Нужен вход в ФГИС: {e}")
@@ -742,6 +747,11 @@ def process_orders_in_batches(db, parser, ids_to_parse=None, mark_in_db=True, ma
         ids_to_parse: явный список номеров. Если None — берётся из БД (parsed=0/NULL).
         mark_in_db: отмечать ли обработанные заказы как parsed=1 в БД.
         max_ids: лимит выборки из БД (только когда ids_to_parse=None).
+
+    Возвращает число ошибок, при которых запуск надо считать неуспешным: батч не сохранён,
+    заявки не отмечены в БД, или не загружена ни одна заявка из всех запрошенных.
+    Отдельные незагруженные заявки — не ошибка запуска: они остаются parsed=0
+    и запрашиваются при следующем запуске.
     """
     BATCH_SIZE = 500
 
@@ -750,13 +760,14 @@ def process_orders_in_batches(db, parser, ids_to_parse=None, mark_in_db=True, ma
         ids_to_parse = get_ids_to_parse(db, max_ids=max_ids, include_unfilled=include_unfilled)
     if not ids_to_parse:
         logger.info("Нет новых заказов для обработки")
-        return
+        return 0
 
     logger.info(f"Начинаем обработку {len(ids_to_parse)} заказов батчами по {BATCH_SIZE}")
 
     total_processed = 0
     total_saved = 0
     total_marked = 0
+    run_errors = 0
 
     for batch_start in range(0, len(ids_to_parse), BATCH_SIZE):
         batch_end = min(batch_start + BATCH_SIZE, len(ids_to_parse))
@@ -808,10 +819,13 @@ def process_orders_in_batches(db, parser, ids_to_parse=None, mark_in_db=True, ma
                             for bid_id in successfully_parsed_ids:
                                 if mark_as_parsed(db, bid_id):
                                     total_marked += 1
+                                else:
+                                    run_errors += 1
                 else:
                     logger.info("Пометка в БД отключена (--no-mark или режим без БД)")
             else:
                 logger.error(f"Не удалось сохранить батч {batch_number}! Заказы НЕ помечены в БД.")
+                run_errors += 1
         else:
             logger.warning(f"Батч {batch_number} пуст - нечего сохранять")
 
@@ -826,6 +840,11 @@ def process_orders_in_batches(db, parser, ids_to_parse=None, mark_in_db=True, ma
     logger.info(f"Отмечено в БД: {total_marked}")
     logger.info(f"Ошибок при обработке: {total_processed - total_saved}")
     logger.info("=" * 60)
+
+    if total_processed and not total_saved:
+        logger.error("Не загружено ни одной заявки — вероятно, недоступен ФГИС или изменился API")
+        run_errors += 1
+    return run_errors
 
 
 def create_recovery_mechanism(db: DatabaseConnection):

@@ -31,7 +31,7 @@ from pipeline_common import ARCHIVE_DIR, ROOT, export_time, latest_full_export, 
 
 ENTITY_TYPE_ID = int(os.environ.get("BITRIX_ENTITY_TYPE_ID") or 137)
 BITRIX_HOST = urlparse(os.environ.get("BITRIX_WEBHOOK_URL", "")).netloc
-STEP_ICONS = {"pending": "⏳", "running": "🔄", "ok": "✅", "failed": "❌", "skipped": "⏭️"}
+STEP_ICONS = {"pending": "⏳", "running": "🔄", "ok": "✅", "errors": "⚠️", "failed": "❌", "skipped": "⏭️"}
 STATUS_TEXT = {"running": "Выполняется", "ok": "Готово", "failed": "Ошибка",
                "auth_required": "Нужен вход в ФГИС", "stopped": "Остановлено"}
 

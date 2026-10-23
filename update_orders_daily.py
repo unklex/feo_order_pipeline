@@ -45,6 +45,7 @@ from bitrix_config import b
 from env_config import require_env, env_int  # значения из .env
 from audit_log import AuditLog
 from db_tunnel import open_db_tunnel  # SSH-туннель или прямое подключение (DB_USE_SSH)
+from pipeline_common import EXIT_PARTIAL
 
 # JSONL-журнал вызовов Битрикс для анализа после запуска (создаётся в main)
 audit = None
@@ -554,12 +555,15 @@ async def run_parallel_update(
     return result
 
 
-async def verify_sample(df_joined: pd.DataFrame, bid_id: str):
-    """Контрольная сверка: перечитывает карточку тестовой заявки и сравнивает статус."""
+async def verify_sample(df_joined: pd.DataFrame, bid_id: str) -> bool:
+    """Контрольная сверка: перечитывает карточку тестовой заявки и сравнивает статус.
+
+    False — статус в карточке не совпал. Заявки нет в данных — не ошибка (True).
+    """
     sample = df_joined[df_joined['ID заявки'] == str(bid_id)]
     if sample.empty or pd.isna(sample.iloc[0].get('bitrix_id')):
         logger.warning(f"Контрольная сверка: заявка {bid_id} не найдена в обновлённых данных")
-        return
+        return True
 
     row = sample.iloc[0]
     bitrix_id = int(row['bitrix_id'])
@@ -578,17 +582,21 @@ async def verify_sample(df_joined: pd.DataFrame, bid_id: str):
            ok=actual == expected)
     if actual == expected:
         logger.info(f"✅ Контрольная сверка OK: заявка {bid_id}, bitrix_id={bitrix_id}, статус={actual}")
-    else:
-        logger.error(f"❌ Контрольная сверка FAIL: заявка {bid_id}, bitrix_id={bitrix_id}, "
-                     f"ожидалось {expected}, в карточке {actual}")
+        return True
+    logger.error(f"❌ Контрольная сверка FAIL: заявка {bid_id}, bitrix_id={bitrix_id}, "
+                 f"ожидалось {expected}, в карточке {actual}")
+    return False
 
 
 # =============================================================================
 # ОСНОВНОЙ ПРОЦЕСС
 # =============================================================================
 
-def main():
-    """Основная функция скрипта."""
+def main() -> int:
+    """Основная функция скрипта.
+
+    Код выхода: 0 — успех, EXIT_PARTIAL — ошибки обновления карточек или сверки, 1 — сбой.
+    """
 
     # Определяем путь к файлу
     if len(sys.argv) > 1:
@@ -739,15 +747,20 @@ def main():
         )
 
         # 10. Контрольная сверка
+        verify_ok = True
         if VERIFY_SAMPLE_BID_ID:
-            asyncio.run(verify_sample(df_joined, VERIFY_SAMPLE_BID_ID))
+            verify_ok = asyncio.run(verify_sample(df_joined, VERIFY_SAMPLE_BID_ID))
 
         _audit("run_summary", input_file=input_file, orders_in_file=len(orders_data),
                failed_to_parse=len(failed_orders), rows=len(df_joined),
                matched_by_bid=int(matched_by_bid), matched_total=int(matched), **result)
         logger.info(f"Обработка завершена: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-        return result
+        if result['error_count'] or not verify_ok:
+            logger.error(f"Запуск завершён с ошибками: ошибок обновления {result['error_count']}, "
+                         f"сверка {'OK' if verify_ok else 'FAIL'}")
+            return EXIT_PARTIAL
+        return 0
 
     except Exception as e:
         logger.exception(f"Критическая ошибка: {e}")
@@ -759,4 +772,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

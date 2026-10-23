@@ -26,3 +26,13 @@ dependencies = [
 [tool.uv]
 # Набор скриптов, а не устанавливаемый пакет: uv только ставит зависимости в .venv
 package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+# Скрипты лежат в корне проекта, а не в пакете
+pythonpath = ["."]
+testpaths = ["tests"]
