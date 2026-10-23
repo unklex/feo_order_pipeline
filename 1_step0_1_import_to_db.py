@@ -15,6 +15,7 @@ import gzip
 import json
 import glob
 import logging
+import argparse
 import pandas as pd
 import re
 from typing import Dict, Any, List, Tuple, Optional
@@ -26,6 +27,7 @@ import pymysql
 
 from audit_log import AuditLog
 from db_tunnel import open_db_tunnel, use_ssh  # SSH-туннель или прямое подключение (DB_USE_SSH)
+from pipeline_common import latest_full_export, noninteractive
 
 # JSONL-журнал итогов по архивам для анализа после запуска (создаётся в main)
 audit = None
@@ -439,7 +441,7 @@ def process_archive(archive_path: str, engine) -> Tuple[int, int, int]:
         logger.error(f"Ошибка при обработке архива {archive_path}: {e}")
         if audit is not None:
             audit.write("archive_error", archive=os.path.basename(archive_path), error=str(e))
-        return 0, 0, 0
+        return None
 
 
 def find_archives(directory: str = '.', pattern: str = 'gisopvk_webapi_*.jsonl.gz') -> List[str]:
@@ -501,9 +503,19 @@ def check_database_structure(engine):
         return False
 
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Импорт выгрузки заказов ФГИС (.jsonl.gz) в new_webapi_orders_transportation.")
+    p.add_argument("--file", action="append", metavar="PATH",
+                   help="Файл выгрузки для импорта; можно указать несколько раз.")
+    p.add_argument("--latest", action="store_true",
+                   help="Импортировать последнюю полную выгрузку (по умолчанию при FEO_NONINTERACTIVE=1).")
+    return p
+
+
 def main():
     """Основная функция скрипта"""
     global audit
+    args = build_arg_parser().parse_args()
     logger.info("Запуск улучшенного импорта минимальных данных заказов")
     audit = AuditLog("import_to_db")
     logger.info(f"Журнал итогов (JSONL): {audit.path}")
@@ -534,38 +546,54 @@ def main():
         if not check_database_structure(engine):
             return 1
 
-        # Находим все архивы
-        archives = find_archives()
-        if not archives:
-            logger.error("Не найдено архивов для обработки")
-            return 1
-
-        # Предлагаем пользователю выбрать архивы для обработки
-        print("\nНайденные архивы:")
-        for i, archive in enumerate(archives, 1):
-            file_size = os.path.getsize(archive) / (1024 * 1024)  # в МБ
-            print(f"{i}. {os.path.basename(archive)} ({file_size:.2f} МБ)")
-
-        choice = input("\nВыберите архивы для обработки (номера через запятую или 'all'): ")
-
-        if choice.lower() == 'all':
-            archives_to_process = archives
+        if args.file:
+            archives_to_process = args.file
+        elif args.latest or noninteractive():
+            # Только последняя полная выгрузка: импорт более старой затёр бы свежие статусы
+            latest = latest_full_export()
+            if latest is None:
+                logger.error("Полная выгрузка (gisopvk_webapi_*_1-N.jsonl.gz) не найдена")
+                return 1
+            archives_to_process = [str(latest)]
+            logger.info(f"Импорт последней полной выгрузки: {latest.name}")
         else:
-            try:
-                selected_indices = [int(idx.strip()) - 1 for idx in choice.split(',')]
-                archives_to_process = [archives[idx] for idx in selected_indices if 0 <= idx < len(archives)]
-            except (ValueError, IndexError):
-                logger.error("Некорректный ввод, обрабатываем все архивы")
+            # Находим все архивы
+            archives = find_archives()
+            if not archives:
+                logger.error("Не найдено архивов для обработки")
+                return 1
+
+            # Предлагаем пользователю выбрать архивы для обработки
+            print("\nНайденные архивы:")
+            for i, archive in enumerate(archives, 1):
+                file_size = os.path.getsize(archive) / (1024 * 1024)  # в МБ
+                print(f"{i}. {os.path.basename(archive)} ({file_size:.2f} МБ)")
+
+            choice = input("\nВыберите архивы для обработки (номера через запятую или 'all'): ")
+
+            if choice.lower() == 'all':
                 archives_to_process = archives
+            else:
+                try:
+                    selected_indices = [int(idx.strip()) - 1 for idx in choice.split(',')]
+                    archives_to_process = [archives[idx] for idx in selected_indices if 0 <= idx < len(archives)]
+                except (ValueError, IndexError):
+                    logger.error("Некорректный ввод, обрабатываем все архивы")
+                    archives_to_process = archives
 
         # Обработка выбранных архивов
         total_records = 0
         total_added = 0
         total_updated = 0
 
+        failed_archives = []
         for archive in archives_to_process:
             print(f"\nОбработка архива {os.path.basename(archive)}...")
-            records, added, updated = process_archive(archive, engine)
+            result = process_archive(archive, engine)
+            if result is None:
+                failed_archives.append(os.path.basename(archive))
+                continue
+            records, added, updated = result
 
             total_records += records
             total_added += added
@@ -581,6 +609,9 @@ def main():
         print(f"Добавлено в базу: {total_added}")
         print(f"Обновлено в базе: {total_updated}")
 
+        if failed_archives:
+            logger.error(f"Архивы с ошибками: {failed_archives}")
+            return 1
         return 0
 
     except Exception as e:

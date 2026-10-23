@@ -13,6 +13,8 @@ import statistics
 from collections import defaultdict
 import requests
 
+from pipeline_common import AuthRequired, noninteractive
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Настройка логирования
@@ -90,6 +92,13 @@ class GisopvkWebApiParser:
         Returns:
             bool: True если авторизация успешна, иначе False
         """
+        if noninteractive():
+            # Без вопросов в консоли: только сохранённый вход (gisopvk_webapi_cookies.json)
+            if self._load_cookies_from_file() and self.test_auth():
+                logger.info("Используем сохраненные cookies авторизации")
+                return True
+            raise AuthRequired("Сохранённый вход в ФГИС недействителен — войдите заново (python login_fgis.py)")
+
         try:
             # Импортируем модуль авторизации
             import auth

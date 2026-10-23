@@ -18,6 +18,7 @@
 import os
 import sys
 import traceback
+import argparse
 import logging
 from datetime import datetime
 import asyncio
@@ -47,7 +48,8 @@ if os.environ.get("BITRIX_LIB_DIR"):
     sys.path.append(os.environ["BITRIX_LIB_DIR"])
 from bitrix_config import b
 from audit_log import AuditLog
-from db_tunnel import open_db_tunnel  # SSH-туннель или прямое подключение (DB_USE_SSH)
+from pipeline_common import noninteractive
+from db_tunnel import open_db_tunnel, use_ssh  # SSH-туннель или прямое подключение (DB_USE_SSH)
 #from tg_bot import send
 
 # JSONL-журнал вызовов Битрикс для анализа после запуска (создаётся в main)
@@ -225,7 +227,8 @@ class DatabaseConnection:
             try:
                 if self.tunnel.is_active:
                     self.tunnel.stop()
-                    logger.info("SSH-туннель закрыт")
+                    if use_ssh():
+                        logger.info("SSH-туннель закрыт")
             except Exception as e:
                 logger.warning(f"Ошибка при закрытии SSH-туннеля: {e}")
             self.tunnel = None
@@ -359,9 +362,16 @@ def create_orders_in_bitrix(b, orders_to_create, entity_type_id=None, max_concur
         return []
 
 
-def main():
+def main() -> int:
+    """Код выхода: 0 — успех или нечего создавать, 1 — ошибка.
+
+    --yes (или FEO_NONINTERACTIVE=1) — создавать без подтверждения в консоли.
+    """
     """Основная функция скрипта создания заказов в Битрикс24"""
     global audit
+    ap = argparse.ArgumentParser(description="Создание пустых карточек СП ФЭО в Битрикс24 для заказов без bitrix_id.")
+    ap.add_argument("--yes", action="store_true", help="Не спрашивать подтверждение.")
+    args = ap.parse_args()
     logger.info("Запуск упрощенного скрипта создания заказов в Битрикс24")
     audit = AuditLog("sync_orders")
     logger.info(f"Журнал вызовов Битрикс (JSONL): {audit.path}")
@@ -385,7 +395,7 @@ def main():
         if db_orders.empty:
             logger.info("Нет заказов для создания в Битрикс24")
             #send("Скрипт завершен: нет заказов для создания в Битрикс24")
-            return
+            return 0
 
         print(f"\nБУДЕТ СОЗДАНО {len(db_orders)} ПУСТЫХ ЗАКАЗОВ В БИТРИКС24")
         print("Примеры bid_id для создания:", db_orders['bid_id'].head(10).tolist())
@@ -393,10 +403,10 @@ def main():
         if not db_orders.empty and 'parsed_at' in db_orders.columns:
             print(f"Диапазон дат: {db_orders['parsed_at'].min()} - {db_orders['parsed_at'].max()}")
 
-        confirm = input("\nПродолжить создание заказов? (y/N): ").strip().lower()
+        confirm = 'y' if (args.yes or noninteractive()) else input("\nПродолжить создание заказов? (y/N): ").strip().lower()
         if confirm not in ['y', 'yes', 'да', 'д']:
             logger.info("Создание заказов отменено пользователем")
-            return
+            return 0
 
         # Создаем заказы в Битрикс24
         logger.info("=" * 60)
@@ -408,7 +418,7 @@ def main():
         if not created_orders:
             logger.error("Не удалось создать ни одного заказа")
             #send("Ошибка: не удалось создать ни одного заказа в Битрикс24")
-            return
+            return 1
 
         # Обновляем bitrix_id в БД для созданных заказов (с авто-reconnect)
         logger.info("=" * 60)
@@ -443,6 +453,7 @@ def main():
         _audit("run_summary", without_bitrix_id=len(db_orders), created=len(created_orders),
                db_updated=updated_count, db_update_failed=len(failed_updates))
         #send(message)
+        return 1 if failed_updates else 0
 
     except Exception as e:
         error_message = f"Критическая ошибка в скрипте создания заказов: {e}"
@@ -450,6 +461,7 @@ def main():
         logger.debug(traceback.format_exc())
         _audit("fatal_error", error=str(e))
         #send(error_message)
+        return 1
 
     finally:
         db.close()
@@ -458,4 +470,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -8,3 +8,5 @@ tqdm
 selenium
 fast_bitrix24
 python-dotenv
+openpyxl
+streamlit>=1.40

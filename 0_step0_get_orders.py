@@ -2,6 +2,7 @@ import time
 import json
 import logging
 import os
+import sys
 from typing import List, Dict, Any, Optional, Generator, Tuple
 from urllib.parse import urlparse, parse_qs
 from requests.exceptions import RequestException
@@ -12,6 +13,8 @@ import re
 import statistics
 from collections import defaultdict
 import requests
+
+from pipeline_common import AuthRequired, EXIT_AUTH_REQUIRED, noninteractive
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -98,6 +101,13 @@ class GisopvkWebApiParser:
         Returns:
             bool: True если авторизация успешна, иначе False
         """
+        if noninteractive():
+            # Без вопросов в консоли: только сохранённый вход, иначе — код EXIT_AUTH_REQUIRED
+            if self._load_cookies_from_file() and self.test_auth():
+                logger.info("Используем сохраненные cookies авторизации")
+                return True
+            raise AuthRequired("Сохранённый вход в ФГИС недействителен — войдите заново (python login_fgis.py)")
+
         try:
             # Пробуем загрузить cookies из файла и проверяем их работоспособность
             if self._load_cookies_from_file() and self.test_auth():
@@ -643,6 +653,7 @@ class GisopvkWebApiParser:
             current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             output_file = f"gisopvk_webapi_{current_time}_{start_page + 1}-{end_page + 1}.jsonl.gz"
 
+        self.current_output_file = output_file  # чтобы main() мог пометить файл как неполный при сбое
         logger.info(f"Потоковая запись в {output_file} (формат JSONL + GZIP)")
 
         # Создаем файл статистики с тем же именем
@@ -662,6 +673,8 @@ class GisopvkWebApiParser:
         batch = []
         empty_pages_count = 0
         max_empty_pages = 3  # Максимальное количество пустых страниц подряд перед выходом
+        page_errors = 0  # ошибок подряд на текущей странице (неинтерактивный режим)
+        max_page_errors = 5
 
         def write_batch_jsonl_gz(file_path, records):
             """Записать пакет записей в JSONL.GZ файл"""
@@ -680,6 +693,7 @@ class GisopvkWebApiParser:
 
             try:
                 response_data = self.get_page(offset, limit)
+                page_errors = 0
 
                 # Обрабатываем результаты текущей страницы
                 data_items = response_data.get('data', [])
@@ -748,6 +762,16 @@ class GisopvkWebApiParser:
                 logger.error(f"Ошибка при обработке страницы: {str(e)}")
                 print(f"\nОшибка при обработке страницы: {str(e)}")
 
+                if noninteractive():
+                    # Без пропуска страниц: выгрузка либо полная, либо прерывается с ошибкой
+                    page_errors += 1
+                    if page_errors > max_page_errors:
+                        if batch:
+                            write_batch_jsonl_gz(output_file, batch)
+                            batch.clear()
+                        raise RuntimeError(
+                            f"Страница offset={offset} не загружается после {max_page_errors} повторов: {e}") from e
+
                 # Проверяем, не ошибка ли это 406 Not Acceptable
                 if '406' in str(e):
                     print("\nОбнаружена ошибка 406 Not Acceptable. Корректируем заголовки...")
@@ -764,6 +788,10 @@ class GisopvkWebApiParser:
                 # Записываем информацию об ошибке
                 with open(progress_file, 'a', encoding='utf-8') as pf:
                     pf.write(f"{datetime.datetime.now():%H:%M:%S} - Ошибка: {str(e)}\n")
+
+                if noninteractive():
+                    time.sleep(self.retry_delay * page_errors)
+                    continue
 
                 # Спрашиваем пользователя, хочет ли он продолжить
                 retry_now = input("\nПроизошла ошибка. Повторить запрос с текущей страницы? (y/n): ")
@@ -826,7 +854,12 @@ class GisopvkWebApiParser:
 
 
 # Основной скрипт для запуска парсера
-def main():
+def main() -> int:
+    """Код выхода: 0 — выгрузка завершена, EXIT_AUTH_REQUIRED — нужен вход в ФГИС, 1 — ошибка.
+
+    FEO_NONINTERACTIVE=1: без вопросов — все страницы, с первой, имя файла автоматически.
+    """
+    interactive = not noninteractive()
     try:
         # Создаем парсер
         parser = GisopvkWebApiParser(
@@ -845,7 +878,7 @@ def main():
         progress_file = "gisopvk_webapi_progress.txt"
         start_page = 0
 
-        if os.path.exists(progress_file):
+        if interactive and os.path.exists(progress_file):
             print("\nНайден файл прогресса. Проверка последнего состояния загрузки...")
             try:
                 # Читаем файл прогресса для определения последнего загруженного диапазона
@@ -866,6 +899,13 @@ def main():
             except Exception as e:
                 logger.error(f"Ошибка при чтении файла прогресса: {str(e)}")
                 print(f"Не удалось прочитать файл прогресса: {str(e)}")
+
+        if not interactive:
+            # Полная выгрузка со страницы 1 — её ищут import и update_orders_daily
+            print("\nНеинтерактивный режим: полная выгрузка с первой страницы...")
+            parser.process_and_save_streaming(None, None, 100, 0)
+            print("\n" + parser.get_stats_summary())
+            return 0
 
         # Запрашиваем максимальное количество страниц для загрузки
         max_pages_input = input("\nВведите максимальное количество страниц для загрузки (Enter для загрузки всех): ")
@@ -915,9 +955,20 @@ def main():
         print("\n" + parser.get_stats_summary())
         print("\nЗагрузка данных завершена.")
 
+        return 0
+
+    except AuthRequired as e:
+        logger.error(f"Нужен вход в ФГИС: {e}")
+        return EXIT_AUTH_REQUIRED
     except Exception as e:
         logger.error(f"Критическая ошибка: {str(e)}")
         print(f"\nПроизошла критическая ошибка: {str(e)}")
+        # Неполная выгрузка не должна выглядеть как полная (её подхватили бы import/update)
+        partial = getattr(locals().get('parser'), 'current_output_file', None)
+        if partial and os.path.exists(partial):
+            os.replace(partial, partial + '.partial')
+            logger.error(f"Неполная выгрузка переименована: {partial}.partial")
+        return 1
     finally:
         # Закрываем ресурсы
         if 'parser' in locals():
@@ -925,8 +976,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-
-
-if __name__ == "__main__":
-    main()
+    sys.exit(main())

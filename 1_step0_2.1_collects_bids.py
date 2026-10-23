@@ -19,9 +19,11 @@ import logging
 import datetime
 import os
 import argparse
+import sys
 from typing import List, Dict, Optional
 
 from db_tunnel import open_db_tunnel, use_ssh  # SSH-туннель или прямое подключение (DB_USE_SSH)
+from pipeline_common import EXIT_AUTH_REQUIRED, AuthRequired, pending_batch_files
 from gisopvkwebapiparser import GisopvkWebApiParser
 import pandas as pd
 
@@ -270,7 +272,8 @@ class DatabaseConnection:
             try:
                 if self.tunnel.is_active:
                     self.tunnel.stop()
-                    logger.info("SSH-туннель закрыт")
+                    if use_ssh():
+                        logger.info("SSH-туннель закрыт")
             except Exception as e:
                 logger.warning(f"Ошибка при закрытии SSH-туннеля: {e}")
             self.tunnel = None
@@ -280,10 +283,25 @@ class DatabaseConnection:
 # Операции с БД (через менеджер соединения)
 # ---------------------------------------------------------------------------
 
-def get_ids_to_parse(db: DatabaseConnection, max_ids: int = 1000) -> List[str]:
+def _bids_in_pending_files() -> set:
+    """Номера заявок, уже лежащие в batch_*.json (ждут заполнения в Битрикс)."""
+    bids = set()
+    for path in pending_batch_files():
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                bids.update(str(rec['id']) for rec in json.load(f) if isinstance(rec, dict) and rec.get('id'))
+        except Exception as e:
+            logger.warning(f"Не удалось прочитать {path.name}: {e}")
+    return bids
+
+
+def get_ids_to_parse(db: DatabaseConnection, max_ids: int = 1000, include_unfilled: bool = False) -> List[str]:
     """
     Получает список bid_id заказов для парсинга. Исключает уже обработанные (parsed = 1).
     При обрыве связи переподключается и повторяет.
+
+    include_unfilled — дополнительно взять «зависшие» заявки: распарсены (parsed=1), карточка
+    в Битрикс есть, но не заполнена (bitrix_filled=0), а файла с их данными уже нет.
     """
     logger.info(f"Получение списка bid_id заказов для обработки (не более {max_ids})")
 
@@ -301,7 +319,27 @@ def get_ids_to_parse(db: DatabaseConnection, max_ids: int = 1000) -> List[str]:
         logger.info(f"Получено {len(ids)} bid_id для обработки")
         return ids
 
-    return db.run(op, description="получение списка bid_id", default=[])
+    ids = db.run(op, description="получение списка bid_id", default=[])
+
+    if include_unfilled:
+        def op_unfilled(engine):
+            query = """
+            SELECT bid_id
+            FROM new_webapi_orders_transportation
+            WHERE is_active = 1 AND parsed = 1 AND bitrix_filled = 0 AND bitrix_id IS NOT NULL
+            ORDER BY bid_id
+            """
+            with engine.connect() as conn:
+                return [str(row[0]) for row in conn.execute(text(query)).fetchall()]
+
+        in_files = _bids_in_pending_files()
+        stuck = [b for b in db.run(op_unfilled, description="получение зависших bid_id", default=[])
+                 if b not in in_files and b not in ids]
+        if stuck:
+            logger.info(f"Зависших заявок (распарсены, но не заполнены, файла нет): {len(stuck)} — запрашиваем заново")
+        ids = ids + stuck[:max(0, max_ids - len(ids))]
+
+    return ids
 
 
 def mark_as_parsed(db: DatabaseConnection, bid_id: str) -> bool:
@@ -547,6 +585,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Максимум заказов из БД за запуск (только для режима БД). По умолчанию 3000."
     )
     parser.add_argument(
+        "--include-unfilled", action="store_true",
+        help="Дополнительно запросить «зависшие» заявки: распарсены, но не заполнены в Битрикс, "
+             "а файла с их данными нет (только для режима БД)."
+    )
+    parser.add_argument(
         "--no-mark", action="store_true",
         help="Не отмечать заказы как обработанные (parsed=1) в БД. "
              "Удобно для разового парсинга произвольных номеров."
@@ -564,7 +607,7 @@ def main(argv=None):
 
     if not check_dependencies():
         logger.error("Критические зависимости отсутствуют. Завершение работы.")
-        return
+        return 1
 
     # Определяем источник номеров: явный список / файл (режим "номера")
     # либо запрос в БД (режим по умолчанию).
@@ -572,7 +615,7 @@ def main(argv=None):
     try:
         if args.ids and args.ids_file:
             logger.error("Укажите либо --ids, либо --ids-file, но не оба сразу")
-            return
+            return 1
         if args.ids:
             explicit_ids = _clean_ids(args.ids)
             logger.info(f"Режим: парсинг номеров из --ids ({len(explicit_ids)} шт.)")
@@ -584,11 +627,11 @@ def main(argv=None):
     except Exception as e:
         logger.error(f"Ошибка при чтении списка номеров: {e}")
         logger.debug(traceback.format_exc())
-        return
+        return 1
 
     if explicit_ids is not None and not explicit_ids:
         logger.error("Список номеров пуст — нечего парсить")
-        return
+        return 1
 
     mark_in_db = not args.no_mark
 
@@ -625,6 +668,8 @@ def main(argv=None):
             if not parser.authorize():
                 raise RuntimeError("Метод authorize() вернул False")
             logger.info("Авторизация успешно выполнена")
+        except AuthRequired:
+            raise
         except Exception as e:
             logger.error(f"Произошла ошибка при авторизации: {e}")
             logger.debug(traceback.format_exc())
@@ -655,11 +700,18 @@ def main(argv=None):
             ids_to_parse=explicit_ids,
             mark_in_db=mark_in_db,
             max_ids=args.max_ids,
+            include_unfilled=args.include_unfilled,
         )
+        exit_code = 0
+
+    except AuthRequired as e:
+        logger.error(f"Нужен вход в ФГИС: {e}")
+        exit_code = EXIT_AUTH_REQUIRED
 
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}")
         logger.debug(traceback.format_exc())
+        exit_code = 1
 
     finally:
         if parser:
@@ -676,8 +728,11 @@ def main(argv=None):
         logger.info("СКРИПТ СБОРА ДАННЫХ ЗАВЕРШЕН")
         logger.info("=" * 70)
 
+    return exit_code
 
-def process_orders_in_batches(db, parser, ids_to_parse=None, mark_in_db=True, max_ids=3000):
+
+def process_orders_in_batches(db, parser, ids_to_parse=None, mark_in_db=True, max_ids=3000,
+                              include_unfilled=False):
     """
     Обрабатывает заказы батчами с безопасным сохранением.
 
@@ -692,7 +747,7 @@ def process_orders_in_batches(db, parser, ids_to_parse=None, mark_in_db=True, ma
 
     # Источник номеров: явный список или выборка из БД
     if ids_to_parse is None:
-        ids_to_parse = get_ids_to_parse(db, max_ids=max_ids)
+        ids_to_parse = get_ids_to_parse(db, max_ids=max_ids, include_unfilled=include_unfilled)
     if not ids_to_parse:
         logger.info("Нет новых заказов для обработки")
         return
@@ -831,4 +886,4 @@ def create_recovery_mechanism(db: DatabaseConnection):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

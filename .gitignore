@@ -12,6 +12,12 @@ gisopvk_webapi_cookies.json
 gisopvk_webapi_*.jsonl.gz
 gisopvk_webapi_*_stats.json
 gisopvk_webapi_progress.txt
+*.partial
+# распарсенные заявки (пишет 1_step0_2.1_collects_bids.py в папку проекта)
+batch_*.json
+parsed_data_*.json
+# отработанные файлы (pipeline.py / fill db.py), чистятся через ARCHIVE_KEEP_DAYS
+archive/
 parsed_bids/
 opvk-export*/
 opvk-export*.zip
@@ -50,5 +56,6 @@ venv/
 # ---------------------------------------------------------------------------
 .idea/
 .vscode/
+.claude/
 Thumbs.db
 .DS_Store

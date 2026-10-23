@@ -69,11 +69,10 @@ def _audit(event, **data):
         audit.write(event, **data)
 
 
-# ===========================================================================
-#  ПУТЬ К JSON-ФАЙЛУ  —  УКАЖИТЕ ЗДЕСЬ
-#  (можно переопределить при запуске:  python 1_step1_fill_db.py --json <путь>)
-# ===========================================================================
-JSON_FILE = os.path.join(SCRIPT_DIR, 'parsed_bids', 'batch_001_20261006_131159.json')
+# Без --json обрабатываются все ожидающие batch_*.json из папки проекта (их пишет
+# 1_step0_2.1_collects_bids.py); файл, все заявки которого заполнены, переносится в archive/.
+from db_tunnel import use_ssh
+from pipeline_common import ROOT, archive_file, pending_batch_files
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +264,8 @@ class DatabaseConnection:
             try:
                 if self.tunnel.is_active:
                     self.tunnel.stop()
-                    logger.info("SSH-туннель закрыт")
+                    if use_ssh():
+                        logger.info("SSH-туннель закрыт")
             except Exception as e:
                 logger.warning(f"Ошибка при закрытии SSH-туннеля: {e}")
             self.tunnel = None
@@ -294,6 +294,60 @@ def load_json_records(json_file: str) -> list:
         logger.warning(f"В JSON повторяются заявки ({len(dup_ids)}): {dup_ids}. Оставлена последняя запись каждой.")
         data = list(by_id.values())
     return data
+
+
+def load_batch_files(json_files: list) -> tuple:
+    """Загружает несколько файлов заявок -> (записи, {файл: [bid_id]}).
+
+    Файлы читаются от старых к новым (по времени изменения), при повторе заявки
+    остаётся запись из самого нового файла.
+    """
+    json_files = sorted(json_files, key=os.path.getmtime)
+    by_id, bids_by_file = {}, {}
+    for json_file in json_files:
+        records = load_json_records(json_file)
+        bids_by_file[json_file] = [rec.get('id') for rec in records if rec.get('id') is not None]
+        for rec in records:
+            by_id[rec.get('id')] = rec
+    return list(by_id.values()), bids_by_file
+
+
+def archive_finished_files(db, bids_by_file: dict) -> list:
+    """Переносит в archive/ файлы из папки проекта, где не осталось заявок, ждущих заполнения.
+
+    Ждёт заполнения: is_active=1, parsed=1, bitrix_filled=0. Файл хотя бы с одной такой
+    заявкой остаётся на месте и будет обработан при следующем запуске.
+    """
+    archived = []
+    for json_file, bid_ids in bids_by_file.items():
+        path = os.path.abspath(json_file)
+        in_root = os.path.normcase(os.path.dirname(path)) == os.path.normcase(str(ROOT))
+        if not in_root or not os.path.basename(path).startswith('batch_'):
+            continue  # явно указанные файлы вне папки проекта не трогаем
+        ids = [str(i) for i in bid_ids]
+
+        def op(engine, _ids=ids):
+            if not _ids:
+                return 0
+            placeholders = ','.join(f":id_{i}" for i in range(len(_ids)))
+            query = f"""
+            SELECT COUNT(*) FROM new_webapi_orders_transportation
+            WHERE bid_id IN ({placeholders}) AND is_active = 1 AND parsed = 1 AND bitrix_filled = 0
+            """
+            with engine.connect() as conn:
+                return conn.execute(text(query), {f"id_{i}": v for i, v in enumerate(_ids)}).scalar()
+
+        waiting = db.run(op, description=f"проверка заполнения {os.path.basename(path)}", default=None)
+        if waiting is None:
+            logger.warning(f"Не удалось проверить {os.path.basename(path)} — файл оставлен на месте")
+        elif waiting:
+            logger.info(f"{os.path.basename(path)}: ещё ждут заполнения {waiting} заявок — файл оставлен")
+        else:
+            target = archive_file(path)
+            archived.append(str(target))
+            logger.info(f"{os.path.basename(path)}: все заявки заполнены — перенесён в {target}")
+    _audit("files_archived", files=archived)
+    return archived
 
 
 def extract_wasteplace(record):
@@ -807,9 +861,8 @@ def read_companies(db: DatabaseConnection) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Основной пайплайн
 # ---------------------------------------------------------------------------
-async def run_pipeline(db: DatabaseConnection, json_file: str, max_concurrent: int):
+async def run_pipeline(db: DatabaseConnection, data: list, max_concurrent: int):
     # 1. JSON -> df_merged
-    data = load_json_records(json_file)
     if not data:
         logger.info("JSON пуст — нечего обрабатывать")
         return
@@ -948,23 +1001,35 @@ async def run_pipeline(db: DatabaseConnection, json_file: str, max_concurrent: i
     # 15. Пометка успешно обновлённых заказов bitrix_filled=1
     marked = mark_orders_filled(db, result.get('successful_item_ids', []))
 
-    _audit("run_summary", json_file=json_file, json_records=len(data), orders_to_fill=len(orders),
+    _audit("run_summary", json_records=len(data), orders_to_fill=len(orders),
            rows_to_update=len(df_joined), marked_filled=marked,
            **{k: v for k, v in result.items() if k != 'successful_item_ids'})
 
 
-async def main_async(args):
+async def main_async(args) -> int:
     global audit
     audit = AuditLog("fill_db")
     logger.info(f"Журнал вызовов Битрикс (JSONL): {audit.path}")
+    json_files = args.json or [str(p) for p in pending_batch_files()]
+    if not json_files:
+        logger.info("Нет файлов заявок (batch_*.json) для заполнения — выход")
+        audit.close()
+        return 0
+    logger.info(f"Файлы заявок ({len(json_files)}): {[os.path.basename(f) for f in json_files]}")
     db = DatabaseConnection()
     try:
         db.reconnect()
-        await run_pipeline(db, args.json, args.max_concurrent)
+        data, bids_by_file = load_batch_files(json_files)
+        _audit("input_files", files={os.path.basename(f): len(b) for f, b in bids_by_file.items()})
+        await run_pipeline(db, data, args.max_concurrent)
+        if not args.no_archive:
+            archive_finished_files(db, bids_by_file)
+        return 0
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}")
         logger.debug(traceback.format_exc())
         _audit("fatal_error", error=str(e))
+        return 1
     finally:
         db.close()
         audit.close()
@@ -973,22 +1038,24 @@ async def main_async(args):
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Заполнение смарт-процесса ФЭО в Битрикс24 из JSON + БД.")
-    p.add_argument("--json", default=JSON_FILE,
-                   help="Путь к распарсенному JSON-файлу (по умолчанию — JSON_FILE в коде).")
+    p.add_argument("--json", action="append", metavar="PATH",
+                   help="Файл распарсенных заявок; можно указать несколько раз. "
+                        "По умолчанию — все batch_*.json в папке проекта.")
+    p.add_argument("--no-archive", action="store_true",
+                   help="Не переносить полностью заполненные файлы в archive/.")
     p.add_argument("--max-concurrent", type=int, default=Config.BITRIX_MAX_CONCURRENT,
                    help="Макс. одновременных запросов к API Битрикс24.")
     return p
 
 
-def main():
+def main() -> int:
     args = build_arg_parser().parse_args()
     logger.info("=" * 70)
     logger.info("ЗАПУСК СКРИПТА ЗАПОЛНЕНИЯ БД -> БИТРИКС24")
-    logger.info(f"JSON: {args.json}")
     logger.info(f"Лог-файл: {LOG_FILE}")
     logger.info("=" * 70)
-    asyncio.run(main_async(args))
+    return asyncio.run(main_async(args))
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
