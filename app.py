@@ -14,6 +14,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -26,7 +27,7 @@ from sqlalchemy import create_engine, text
 import env_config  # noqa: F401  (подгружает .env)
 import pipeline
 from db_tunnel import open_db_tunnel
-from pipeline_common import ARCHIVE_DIR, ROOT, export_time, latest_full_export, pending_batch_files
+from pipeline_common import ARCHIVE_DIR, ROOT, export_time, latest_full_export, pending_batch_files, pid_alive
 
 ENTITY_TYPE_ID = int(os.environ.get("BITRIX_ENTITY_TYPE_ID") or 137)
 BITRIX_HOST = urlparse(os.environ.get("BITRIX_WEBHOOK_URL", "")).netloc
@@ -51,26 +52,60 @@ def launch(args: list):
     subprocess.Popen([sys.executable, *args], **kwargs)
 
 
-def stop(state: dict):
-    pid = state.get("pid")
+def launch_run(args: list, timeout=10.0):
+    """Запускает pipeline.py и ждёт, пока он запишет своё состояние «running».
+
+    Иначе страница перерисуется раньше, чем runner создаст pipeline_state.json, и не увидит запуск.
+    """
+    before = pipeline.read_state().get("started")
+    launch(["pipeline.py", *args])
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        state = pipeline.read_state()
+        if state.get("started") != before and state.get("status") == "running":
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def stop(state: dict) -> str:
+    """Останавливает runner вместе с шагами. Возвращает текст ошибки или '' при успехе."""
+    pid = int(state.get("pid"))
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+        r = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
+                           text=True, encoding="oem", errors="replace")
+        details = (r.stdout + r.stderr).strip()
     else:
-        os.killpg(int(pid), signal.SIGTERM)
+        os.killpg(pid, signal.SIGTERM)
+        details = ""
+    # TerminateProcess асинхронный — ждём, пока процесс действительно исчезнет
+    deadline = time.time() + 10
+    while pid_alive(pid) and time.time() < deadline:
+        time.sleep(0.3)
+    if pid_alive(pid):
+        return f"Не удалось остановить процесс {pid}: {details or 'процесс всё ещё работает'}"
+    # runner больше не пишет состояние — отмечаем остановку сами
+    state = pipeline.read_state() or state
     state.update(status="stopped", message="Остановлено вручную",
                  finished=datetime.now().isoformat(timespec="seconds"))
     for step in state.get("steps", []):
         if step["status"] in ("running", "pending"):
             step["status"] = "failed" if step["status"] == "running" else "skipped"
     pipeline.STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return ""
 
 
 def tail(path, lines=200) -> str:
+    """Последние строки файла — читаем только его конец (журнал выгрузки бывает большим)."""
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            return "".join(f.readlines()[-lines:])
-    except FileNotFoundError:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max(lines * 400, 64_000)))
+            data = f.read().decode("utf-8", errors="replace")
+    except (FileNotFoundError, OSError, TypeError):
         return ""
+    return "\n".join(data.splitlines()[-lines:])
 
 
 def duration(started: str, finished: str = None) -> str:
@@ -154,8 +189,9 @@ def scenario_buttons(state: dict):
                    "заполнение карточек → статусы. Зависшие заявки (распарсены, но не заполнены) "
                    "запрашиваются заново.")
         if st.button("▶ Добавить и заполнить", type="primary", disabled=busy, use_container_width=True):
-            launch(["pipeline.py", "add"])
-            st.toast("Запущено: добавление новых заказов")
+            with st.spinner("Запускаю…"):
+                started = launch_run(["add"])
+            st.toast("Запущено: добавление новых заказов" if started else "Запуск не подтвердился — см. журнал")
             st.rerun()
     with c2, st.container(border=True):
         st.subheader("Статусы")
@@ -166,8 +202,9 @@ def scenario_buttons(state: dict):
             else "Не скачивать заново (выгрузки пока нет)",
             disabled=busy or latest is None)
         if st.button("▶ Обновить статусы", type="primary", disabled=busy, use_container_width=True):
-            launch(["pipeline.py", "statuses", *(["--skip-download"] if skip else [])])
-            st.toast("Запущено: обновление статусов")
+            with st.spinner("Запускаю…"):
+                started = launch_run(["statuses", *(["--skip-download"] if skip else [])])
+            st.toast("Запущено: обновление статусов" if started else "Запуск не подтвердился — см. журнал")
             st.rerun()
 
     with st.container(border=True):
@@ -192,10 +229,12 @@ def run_panel():
         st.info("Запусков ещё не было.")
         return
     status = state.get("status")
-    # запуск закончился — перерисовать всю страницу, чтобы снова включить кнопки сценариев
-    was_running = st.session_state.get("run_was_running", False)
-    st.session_state["run_was_running"] = status == "running"
-    if was_running and status != "running":
+    # Запуск начался или закончился — перерисовать всю страницу: кнопки сценариев и «Остановить»
+    # живут вне этого фрагмента и должны включиться/выключиться.
+    seen = (state.get("started"), status == "running")
+    previous = st.session_state.get("run_seen")
+    st.session_state["run_seen"] = seen
+    if previous is not None and previous != seen:
         st.rerun(scope="app")
     st.markdown(f"**{state.get('title')}** — {STATUS_TEXT.get(status, status)}  \n"
                 f"Начало: {state.get('started', '').replace('T', ' ')}"
@@ -224,14 +263,12 @@ def run_panel():
             st.progress(frac, text=f"{label} · {p['done']} из {p['total']} {p['unit']} ({frac:.0%})")
         else:
             st.progress(0, text=f"{label} · подготовка…")
-        if st.button("■ Остановить", type="secondary"):
-            stop(state)
-            st.rerun()
 
     log_file = state.get("log_file", "")
     st.code(tail(log_file, 20) or "(журнал пуст)", language=None)
-    with st.expander("Весь журнал запуска"):
-        st.code(tail(log_file, 5000) or "(журнал пуст)", language=None, height=500)
+    # весь журнал рисуем только по запросу: перерисовка тысяч строк раз в 2 с тормозит страницу
+    if st.toggle("Показать весь журнал запуска"):
+        st.code(tail(log_file, 3000) or "(журнал пуст)", language=None, height=500)
 
 
 def run_tab():
@@ -239,6 +276,17 @@ def run_tab():
     scenario_buttons(state)
     st.divider()
     st.subheader("Текущий / последний запуск")
+    # «Остановить» — вне обновляемого раз в 2 с фрагмента: кнопка внутри него пересоздаётся
+    # при каждой перерисовке, и нажатие могло теряться
+    if state.get("status") == "running":
+        if st.button("■ Остановить запуск", type="secondary"):
+            with st.spinner("Останавливаю…"):
+                error = stop(state)
+            if error:
+                st.error(error)
+            else:
+                st.toast("Запуск остановлен")
+                st.rerun()
     run_panel()
     with st.expander("Прошлые запуски"):
         logs = sorted(pipeline.LOG_DIR.glob("pipeline_*.log"), reverse=True)
