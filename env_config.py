@@ -7,7 +7,7 @@ try:
     load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 except ImportError:
     # python-dotenv не установлен - используем только реальные переменные окружения
-    # Установка: pip install python-dotenv
+    # Установка: uv sync
     pass
 
 

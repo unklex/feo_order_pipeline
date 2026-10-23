@@ -5,22 +5,23 @@
 
 ## Установка
 
+Зависимости ставит [uv](https://docs.astral.sh/uv/) (`pyproject.toml` + точные версии в `uv.lock`):
+
 ```powershell
 git clone https://github.com/unklex/feo_order_pipeline.git
 cd feo_order_pipeline
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+uv sync                       # создаст .venv и поставит пакеты (при необходимости и Python 3.13)
 Copy-Item .env.example .env   # затем заполнить .env
 ```
 
-Нужны Python 3.13+ и Google Chrome (вход на gisopvk.ru).
+После `git pull` достаточно снова выполнить `uv sync`. Новый пакет: `uv add <пакет>` (обновит
+`pyproject.toml` и `uv.lock` — их коммитить). Нужен Google Chrome (вход на gisopvk.ru).
 Во внутренней сети: `DB_USE_SSH=0`, `DB_HOST=<внутренний IP сервера БД>`; снаружи — `DB_USE_SSH=1` и `SSH_*`.
 
 ## Работа через UI
 
 ```powershell
-streamlit run app.py
+uv run streamlit run app.py
 ```
 
 Откроется http://localhost:8501:
@@ -39,16 +40,17 @@ streamlit run app.py
 ## То же из консоли
 
 ```powershell
-python login_fgis.py                    # вход в ФГИС (если просрочен)
-python pipeline.py add                  # новые заказы целиком
-python pipeline.py statuses             # статусы
-python pipeline.py statuses --skip-download
+uv run login_fgis.py                    # вход в ФГИС (если просрочен)
+uv run pipeline.py add                  # новые заказы целиком
+uv run pipeline.py statuses             # статусы
+uv run pipeline.py statuses --skip-download
 ```
 
 Код выхода: 0 — успех, 3 — нужен вход в ФГИС, 1 — ошибка. Для ежедневного запуска статусов —
-Планировщик заданий Windows: `.venv\Scripts\python.exe pipeline.py statuses`, рабочая папка — папка проекта.
+Планировщик заданий Windows: программа `.venv\Scripts\python.exe`, аргументы `pipeline.py statuses`,
+рабочая папка — папка проекта.
 
-Отдельные шаги можно запускать как раньше (с вопросами в консоли): `0_step0_get_orders.py`,
+Отдельные шаги можно запускать как раньше, через `uv run` (с вопросами в консоли): `0_step0_get_orders.py`,
 `1_step0_1_import_to_db.py`, `new_2.1_sync_orders_transportation.py`, `1_step0_2.1_collects_bids.py`,
 `fill db.py`, `update_orders_daily.py`.
 

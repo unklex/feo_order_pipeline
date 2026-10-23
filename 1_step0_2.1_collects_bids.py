@@ -37,7 +37,7 @@ try:
     load_dotenv()
 except ImportError:
     # python-dotenv не установлен — работаем только с реальными переменными окружения.
-    # Установка: pip install python-dotenv
+    # Установка: uv sync
     pass
 
 

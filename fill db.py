@@ -46,7 +46,7 @@ try:
 except ImportError:
     print(
         "[ВНИМАНИЕ] Не установлен пакет python-dotenv — файл .env НЕ загружен. "
-        "Установите его: pip install python-dotenv",
+        "Установите зависимости: uv sync",
         file=sys.stderr,
     )
 
