@@ -22,7 +22,7 @@ from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime
 from pandas import json_normalize
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import bindparam, create_engine, text
 import pymysql
 
 from audit_log import AuditLog
@@ -264,10 +264,90 @@ def process_datetime_column(series: pd.Series) -> pd.Series:
     return series.apply(clean_datetime)
 
 
+REPLACED_TABLE = 'replaced_transports'
+
+REPLACED_DDL = f"""
+CREATE TABLE IF NOT EXISTS {REPLACED_TABLE} (
+    id          VARCHAR(20) NOT NULL COMMENT 'Заменённое транспортирование',
+    bid_id      VARCHAR(20) NOT NULL COMMENT 'Заявка, у которой оно было',
+    replaced_by VARCHAR(20) NOT NULL COMMENT 'Новое транспортирование заявки',
+    replaced_at DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id)
+) DEFAULT CHARSET = utf8mb4
+  COMMENT = 'Транспортирования, пересозданные ФГИС: старые не заводятся отдельной заявкой'
+"""
+
+
+def one_transport_per_bid(df: pd.DataFrame) -> pd.DataFrame:
+    """Одна строка на заявку: активное транспортирование, затем самое свежее (как в update_orders_daily)."""
+    has_bid = df['bid_id'].notna()
+    current = (df[has_bid]
+               .sort_values(['bid_id', 'is_active', 'dt_update'], na_position='first')
+               .drop_duplicates('bid_id', keep='last'))
+    dropped = int(has_bid.sum()) - len(current)
+    if dropped:
+        logger.info(f"Несколько транспортирований у одной заявки в выгрузке — оставлено текущее, пропущено {dropped}")
+    if (~has_bid).any():
+        logger.warning(f"Записи без номера заявки пропущены: {int((~has_bid).sum())}")
+    return current
+
+
+def rekey_replaced_transports(conn, table_name: str, temp_table_name: str) -> int:
+    """Строка заявки переходит на её новое транспортирование.
+
+    ФГИС пересоздаёт транспортирование: у заявки появляется новый id, а старый уходит
+    в отдельную служебную заявку со статусом old. bid_id в таблице уникален, поэтому новый
+    id не вставить отдельной строкой — меняем id в строке заявки (карточка Битрикс та же),
+    сбрасываем parsed/bitrix_filled, чтобы заявку загрузили и карточку заполнили заново,
+    а старый id записываем в replaced_transports. Возвращает число переведённых строк.
+    """
+    pairs = conn.execute(text(f"""
+        SELECT t.id AS old_id, s.id AS new_id, t.bid_id
+        FROM {table_name} AS t
+        JOIN {temp_table_name} AS s ON s.bid_id = t.bid_id
+        WHERE t.id <> s.id
+    """)).mappings().all()
+    if not pairs:
+        return 0
+
+    taken = {row[0] for row in conn.execute(
+        text(f"SELECT id FROM {table_name} WHERE id IN :ids").bindparams(bindparam('ids', expanding=True)),
+        {"ids": [p['new_id'] for p in pairs]})}
+    rekeyed = []
+    for pair in pairs:
+        if pair['new_id'] in taken:
+            # Новый id уже числится за другой заявкой — разбираться вручную, строку не трогаем
+            logger.warning(f"Заявка {pair['bid_id']}: новое транспортирование {pair['new_id']} уже есть в БД "
+                           f"у другой заявки — пропущено")
+            continue
+        conn.execute(text(f"""
+            INSERT IGNORE INTO {REPLACED_TABLE} (id, bid_id, replaced_by)
+            VALUES (:old_id, :bid_id, :new_id)
+        """), dict(pair))
+        conn.execute(text(f"""
+            UPDATE {table_name}
+            SET id = :new_id, parsed = 0, parsed_at = NULL, bitrix_filled = 0, updated_at = NOW()
+            WHERE id = :old_id AND bid_id = :bid_id
+        """), dict(pair))
+        rekeyed.append(pair)
+
+    if rekeyed:
+        logger.warning(f"⚠️ Транспортирование пересоздано ФГИС, строка заявки переведена на новое: {len(rekeyed)} "
+                       f"(примеры: {[(p['bid_id'], p['old_id'], p['new_id']) for p in rekeyed[:5]]})")
+        if audit is not None:
+            audit.write("transport_rekeyed", count=len(rekeyed),
+                        items=[{'bid_id': p['bid_id'], 'old_id': p['old_id'], 'new_id': p['new_id']}
+                               for p in rekeyed])
+    return len(rekeyed)
+
+
 def save_minimal_to_database(df: pd.DataFrame, engine) -> Tuple[int, int]:
     """
-    Сохраняет минимальные данные в БД с защитой от дубликатов и 
-    сохранением статуса синхронизации Bitrix
+    Сохраняет минимальные данные в БД с защитой от дубликатов и
+    сохранением статуса синхронизации Bitrix.
+
+    Ключ строки — номер заявки (bid_id уникален): новое транспортирование существующей
+    заявки обновляет её строку (см. rekey_replaced_transports), а не вставляется отдельно.
     """
     if df.empty:
         logger.warning("Пустой DataFrame")
@@ -278,6 +358,8 @@ def save_minimal_to_database(df: pd.DataFrame, engine) -> Tuple[int, int]:
     # Названия таблиц
     table_name = 'new_webapi_orders_transportation'
     temp_table_name = 'temp_new_webapi_orders_transportation'
+
+    df = one_transport_per_bid(df)
 
     # Записываем во временную таблицу
     logger.info(f"Запись во временную таблицу {temp_table_name}")
@@ -291,9 +373,18 @@ def save_minimal_to_database(df: pd.DataFrame, engine) -> Tuple[int, int]:
     rows_added = 0
     rows_updated = 0
 
+    # DDL отдельно: внутри транзакции MariaDB неявно фиксирует её на CREATE TABLE
+    with engine.begin() as conn:
+        conn.execute(text(REPLACED_DDL))
+
     with engine.begin() as conn:
         try:
-            # 1. ДОБАВЛЯЕМ ТОЛЬКО НОВЫЕ ЗАПИСИ
+            # 0. ПЕРЕСОЗДАННЫЕ ТРАНСПОРТИРОВАНИЯ: строка заявки переходит на новый id
+            rekeyed = rekey_replaced_transports(conn, table_name, temp_table_name)
+
+            # 1. ДОБАВЛЯЕМ ТОЛЬКО НОВЫЕ ЗАЯВКИ
+            # Не вставляем: id, который уже есть (в т.ч. у другой заявки — старое транспортирование,
+            # перенесённое ФГИС в служебную заявку), заявку, которая уже есть, и заменённые id.
             logger.info("Добавление новых записей")
             insert_query = text(f"""
                 INSERT INTO {table_name} (
@@ -309,14 +400,32 @@ def save_minimal_to_database(df: pd.DataFrame, engine) -> Tuple[int, int]:
                     bitrix_last_sync, bitrix_error_message
                 FROM {temp_table_name}
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM {table_name} 
+                    SELECT 1 FROM {table_name}
                     WHERE {table_name}.id = {temp_table_name}.id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM {table_name}
+                    WHERE {table_name}.bid_id = {temp_table_name}.bid_id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM {REPLACED_TABLE}
+                    WHERE {REPLACED_TABLE}.id = {temp_table_name}.id
                 )
             """)
 
             result = conn.execute(insert_query)
             rows_added = result.rowcount
             logger.info(f"✅ Добавлено {rows_added} новых записей")
+
+            # Транспортирования, которые в выгрузке числятся за другой заявкой, чем в БД
+            # (старые, перенесённые ФГИС в служебную заявку): строку заявки не трогаем
+            moved = conn.execute(text(f"""
+                SELECT COUNT(*) FROM {table_name} AS target
+                JOIN {temp_table_name} AS source ON target.id = source.id
+                WHERE NOT (target.bid_id <=> source.bid_id)
+            """)).scalar()
+            if moved:
+                logger.info(f"ℹ️ Транспортирований, перенесённых ФГИС в другую заявку (строки не изменены): {moved}")
 
             # 2. СБРОС СТАТУСА СИНХРОНИЗАЦИИ ПРИ КРИТИЧЕСКИХ ИЗМЕНЕНИЯХ
             # Идёт ДО обновления полей: сброшенная запись становится 'pending' и получает
@@ -326,7 +435,7 @@ def save_minimal_to_database(df: pd.DataFrame, engine) -> Tuple[int, int]:
             logger.info("Проверка критических изменений в синхронизированных записях")
             reset_sync_query = text(f"""
                 UPDATE {table_name} AS target
-                JOIN {temp_table_name} AS source ON target.id = source.id
+                JOIN {temp_table_name} AS source ON target.id = source.id AND target.bid_id = source.bid_id
                 SET
                     target.bitrix_sync_status = 'pending',
                     target.bitrix_last_sync = NULL,
@@ -351,7 +460,7 @@ def save_minimal_to_database(df: pd.DataFrame, engine) -> Tuple[int, int]:
             logger.info("Обновление несинхронизированных записей")
             update_query = text(f"""
                 UPDATE {table_name} AS target
-                JOIN {temp_table_name} AS source ON target.id = source.id
+                JOIN {temp_table_name} AS source ON target.id = source.id AND target.bid_id = source.bid_id
                 SET
                     target.status_label = source.status_label,
                     target.status_dt = source.status_dt,
@@ -360,7 +469,6 @@ def save_minimal_to_database(df: pd.DataFrame, engine) -> Tuple[int, int]:
                     target.accrual_status = source.accrual_status,
                     target.accrual_date = source.accrual_date,
                     target.accrual_paid = source.accrual_paid,
-                    target.bid_id = source.bid_id,
                     target.org_id = source.org_id,
                     target.org_name = source.org_name,
                     target.org_owner_inn = source.org_owner_inn,
@@ -395,7 +503,7 @@ def save_minimal_to_database(df: pd.DataFrame, engine) -> Tuple[int, int]:
                 logger.info(f"ℹ️ Пропущено {synced_count} уже синхронизированных записей")
 
             if audit is not None:
-                audit.write("db_merge", rows_in_file=len(df), rows_added=rows_added,
+                audit.write("db_merge", rows_in_file=len(df), rows_added=rows_added, rekeyed=rekeyed, moved=moved,
                             rows_updated=rows_updated, sync_reset=reset_count, synced_untouched=synced_count)
 
             # Удаляем временную таблицу
