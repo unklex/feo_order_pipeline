@@ -73,6 +73,16 @@ def tail(path, lines=200) -> str:
         return ""
 
 
+def duration(started: str, finished: str = None) -> str:
+    """'4 мин 05 с' между двумя ISO-метками (без finished — до текущего момента)."""
+    try:
+        end = datetime.fromisoformat(finished) if finished else datetime.now()
+        seconds = int((end - datetime.fromisoformat(started)).total_seconds())
+    except (TypeError, ValueError):
+        return ""
+    return f"{seconds // 60} мин {seconds % 60:02d} с" if seconds >= 60 else f"{seconds} с"
+
+
 def current_state() -> dict:
     state = pipeline.read_state()
     if state.get("status") == "running" and not pipeline.is_running(state):
@@ -182,6 +192,11 @@ def run_panel():
         st.info("Запусков ещё не было.")
         return
     status = state.get("status")
+    # запуск закончился — перерисовать всю страницу, чтобы снова включить кнопки сценариев
+    was_running = st.session_state.get("run_was_running", False)
+    st.session_state["run_was_running"] = status == "running"
+    if was_running and status != "running":
+        st.rerun(scope="app")
     st.markdown(f"**{state.get('title')}** — {STATUS_TEXT.get(status, status)}  \n"
                 f"Начало: {state.get('started', '').replace('T', ' ')}"
                 + (f" · конец: {state['finished'].replace('T', ' ')}" if state.get("finished") else "")
@@ -193,13 +208,30 @@ def run_panel():
     elif status in ("failed", "stopped"):
         st.error(state.get("message") or STATUS_TEXT[status])
 
+    steps = state.get("steps", [])
     st.markdown("  \n".join(f"{STEP_ICONS.get(s['status'], '')} {s['title']}"
+                            + (f" — {duration(s['started'], s.get('finished'))}" if s.get("started") else "")
                             + (f" (код {s['rc']})" if s.get("rc") not in (None, 0) else "")
-                            for s in state.get("steps", [])))
-    if status == "running" and st.button("■ Остановить", type="secondary"):
-        stop(state)
-        st.rerun()
-    st.code(tail(state.get("log_file", "")) or "(журнал пуст)", language=None)
+                            for s in steps))
+
+    current = next((s for s in steps if s["status"] == "running"), None) if status == "running" else None
+    if current:
+        number = steps.index(current) + 1
+        p = current.get("progress") or {}
+        label = f"Шаг {number}/{len(steps)}: {current['title']} · {duration(current['started'])}"
+        if p.get("total"):
+            frac = min(p["done"] / p["total"], 1.0)
+            st.progress(frac, text=f"{label} · {p['done']} из {p['total']} {p['unit']} ({frac:.0%})")
+        else:
+            st.progress(0, text=f"{label} · подготовка…")
+        if st.button("■ Остановить", type="secondary"):
+            stop(state)
+            st.rerun()
+
+    log_file = state.get("log_file", "")
+    st.code(tail(log_file, 20) or "(журнал пуст)", language=None)
+    with st.expander("Весь журнал запуска"):
+        st.code(tail(log_file, 5000) or "(журнал пуст)", language=None, height=500)
 
 
 def run_tab():

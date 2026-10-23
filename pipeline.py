@@ -15,6 +15,7 @@ ARCHIVE_KEEP_DAYS (по умолчанию 30) дней удаляются.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -42,6 +43,27 @@ SCENARIOS = {
     "add": ("Добавить и заполнить новые заказы", ["download", "import", "sync", "collect", "fill", "statuses"]),
     "statuses": ("Обновить статусы", ["download", "statuses"]),
 }
+
+
+# Прогресс шага из его вывода (шаблоны без кириллицы — не зависят от формулировок логов)
+RE_TOTAL_PAGES = re.compile(r"~\d+,\s*\S+\s*~(\d+)")          # "записей: ~3540, страниц: ~177"
+RE_PAGE = re.compile(r"offset=(\d+), limit=(\d+)")            # "Загрузка страницы с offset=140, limit=20"
+RE_BID = re.compile(r"(\d+)/(\d+) - ID: ")                     # "Батч 1: обработка 3/59 - ID: 156321"
+RE_TQDM = re.compile(r"(\d+)%\|.*?(\d+)/(\d+) \[")             # "Обновление записей:  10%|█  | 350/3500 [..."
+
+
+def parse_progress(line: str, progress: dict):
+    """Обновляет progress {done, total, unit} по строке вывода; True — строка прогресс-бара tqdm."""
+    if m := RE_TQDM.search(line):
+        progress.update(done=int(m.group(2)), total=int(m.group(3)), unit="карточек")
+        return True
+    if m := RE_TOTAL_PAGES.search(line):
+        progress.update(done=0, total=int(m.group(1)), unit="стр.")
+    elif (m := RE_PAGE.search(line)) and progress.get("unit") == "стр.":
+        progress["done"] = min(int(m.group(1)) // max(int(m.group(2)), 1), progress["total"])
+    elif m := RE_BID.search(line):
+        progress.update(done=int(m.group(1)), total=int(m.group(2)), unit="заявок")
+    return False
 
 
 def read_state() -> dict:
@@ -93,14 +115,29 @@ class Run:
         number = self.state["steps"].index(step) + 1
         self.echo(f"\n===== Шаг {number}/{len(self.state['steps'])}: {title} =====")
         env = dict(os.environ, FEO_NONINTERACTIVE="1", PYTHONIOENCODING="utf-8", PYTHONUTF8="1",
-                   PYTHONUNBUFFERED="1", TQDM_DISABLE="1")
+                   PYTHONUNBUFFERED="1")
         proc = subprocess.Popen(
             [sys.executable, "-u", script, *make_args(export)], cwd=ROOT, env=env,
             stdin=subprocess.DEVNULL,  # пропущенный input() упадёт сразу, а не зависнет
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
         )
-        for line in proc.stdout:
-            self.echo(line.rstrip("\n"))
+        progress = step.setdefault("progress", {})
+        last_save, last_bar_decile = 0.0, -1
+        for line in proc.stdout:  # '\r' прогресс-бара tqdm тоже разбивает строки
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            if parse_progress(line, progress):
+                # tqdm обновляется несколько раз в секунду — в журнал только каждые 10%
+                decile = progress["done"] * 10 // max(progress["total"], 1)
+                if decile != last_bar_decile:
+                    last_bar_decile = decile
+                    self.echo(line.strip())
+            else:
+                self.echo(line)
+            if progress and time.time() - last_save >= 1:
+                last_save = time.time()
+                self.save()
         rc = proc.wait()
         ok = rc == 0
         step.update(status="ok" if ok else "failed", rc=rc, finished=datetime.now().isoformat(timespec="seconds"))
