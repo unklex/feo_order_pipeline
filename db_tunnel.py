@@ -81,6 +81,9 @@ def open_db_tunnel(db_host: str, db_port: int, *, prefix: str = "SSH", **tunnel_
         allow_agent=False,
         host_pkey_directories=[],
         remote_bind_address=(db_host, int(db_port)),
+        # Только loopback: по умолчанию sshtunnel слушает 0.0.0.0 — туннель к БД был бы
+        # открыт всей локальной сети, а подключение к 0.0.0.0 в Windows не работает (WinError 10049).
+        local_bind_address=("127.0.0.1", 0),
         **tunnel_kwargs,
     )
     tunnel.start()
