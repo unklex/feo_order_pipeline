@@ -494,8 +494,8 @@ def write_markdown(report: dict, path: Path):
         lines += ["", "| поле | типы | заполнено | значения / пример |", "|---|---|---|---|"]
         for field, s in e["schema"].items():
             shown = s.get("values") or s.get("example")
-            lines.append(f"| `{field}` | {', '.join(s['types'])} | {s['filled']}/{s['of']} | "
-                         f"{json.dumps(shown, ensure_ascii=False)[:120] if shown is not None else ''} |")
+            shown = json.dumps(shown, ensure_ascii=False)[:120].replace("|", "\\|") if shown is not None else ""
+            lines.append(f"| `{field}` | {', '.join(s['types'])} | {s['filled']}/{s['of']} | {shown} |")
         if e.get("related"):
             lines += ["", "Связи (links.related):"]
             for rel, r in e["related"].items():

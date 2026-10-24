@@ -66,7 +66,7 @@ uv run pipeline.py statuses --skip-download
 сбрасывает «загружена/заполнена», чтобы карточку заполнили заново, а старый ID записывает в
 `replaced_transports` — отдельной заявкой и карточкой он не заводится.
 
-Структура API ФГИС (поля эндпоинтов, какие sort/фильтры/include работают, время ответа) — `uv run api_probe.py`, только чтение; отчёт в `reports/api_probe_<время>/report.md`.
+Структура API ФГИС (поля эндпоинтов, какие sort/фильтры/include работают, время ответа) — `uv run api_probe.py` или кнопка «Исследовать API» на вкладке **API ФГИС**, только чтение; отчёт в `reports/api_probe_<время>/report.md` (там же скачать md/json/zip).
 
 Тесты: `uv run pytest`.
 

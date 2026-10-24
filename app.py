@@ -9,12 +9,15 @@ UI пайплайна ФЭО: заказы ФГИС ОПВК -> MySQL -> Бит�
 """
 
 import gzip
+import io
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
+import zipfile
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +27,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 
+import api_probe
 import env_config  # noqa: F401  (подгружает .env)
 import pipeline
 from db_tunnel import open_db_tunnel
@@ -41,15 +45,23 @@ st.set_page_config(page_title="ФЭО: ФГИС → Битрикс24", page_icon
 # ---------------------------------------------------------------------------
 # Процессы
 # ---------------------------------------------------------------------------
-def launch(args: list):
-    """Запускает python-скрипт отдельным процессом, не привязанным к сессии Streamlit."""
+def launch(args: list, log_path: Path = None) -> int:
+    """Запускает python-скрипт отдельным процессом, не привязанным к сессии Streamlit. Возвращает PID.
+
+    log_path — куда писать вывод скрипта (иначе он отбрасывается).
+    """
     kwargs = dict(cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if os.name == "nt":
         # своя группа (Ctrl+C в окне Streamlit её не задевает) и без консольных окон у шагов
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     else:
         kwargs["start_new_session"] = True
-    subprocess.Popen([sys.executable, *args], **kwargs)
+    if log_path is None:
+        return subprocess.Popen([sys.executable, *args], **kwargs).pid
+    kwargs["env"] = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1")
+    with open(log_path, "wb") as log:
+        kwargs.update(stdout=log, stderr=subprocess.STDOUT)
+        return subprocess.Popen([sys.executable, *args], **kwargs).pid
 
 
 def launch_run(args: list, timeout=10.0):
@@ -68,9 +80,8 @@ def launch_run(args: list, timeout=10.0):
     return False
 
 
-def stop(state: dict) -> str:
-    """Останавливает runner вместе с шагами. Возвращает текст ошибки или '' при успехе."""
-    pid = int(state.get("pid"))
+def kill_tree(pid: int) -> str:
+    """Завершает процесс с дочерними и ждёт его исчезновения. Возвращает текст ошибки или ''."""
     if os.name == "nt":
         r = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
                            text=True, encoding="oem", errors="replace")
@@ -84,6 +95,14 @@ def stop(state: dict) -> str:
         time.sleep(0.3)
     if pid_alive(pid):
         return f"Не удалось остановить процесс {pid}: {details or 'процесс всё ещё работает'}"
+    return ""
+
+
+def stop(state: dict) -> str:
+    """Останавливает runner вместе с шагами. Возвращает текст ошибки или '' при успехе."""
+    error = kill_tree(int(state.get("pid")))
+    if error:
+        return error
     # runner больше не пишет состояние — отмечаем остановку сами
     state = pipeline.read_state() or state
     state.update(status="stopped", message="Остановлено вручную",
@@ -389,11 +408,150 @@ def audit_tab():
 
 
 # ---------------------------------------------------------------------------
+# Вкладка «API ФГИС» (api_probe.py)
+# ---------------------------------------------------------------------------
+REPORTS_DIR = ROOT / "reports"
+PROBE_STATE = REPORTS_DIR / "api_probe_state.json"
+
+
+def probe_state() -> dict:
+    try:
+        state = json.loads(PROBE_STATE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return {}
+    state["running"] = pid_alive(state.get("pid"))
+    return state
+
+
+def probe_reports() -> list:
+    return sorted((p for p in REPORTS_DIR.glob("api_probe_*") if p.is_dir()), reverse=True)
+
+
+def zip_folder(folder: Path) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in folder.rglob("*"):
+            if f.is_file():
+                z.write(f, f.relative_to(folder.parent))
+    return buf.getvalue()
+
+
+def start_probe(deep: list, extra: str, raw: bool, sample: int) -> str:
+    """Запускает api_probe.py. Возвращает текст ошибки или ''."""
+    args = ["api_probe.py", "--sample", str(sample)]
+    for name in deep:
+        args += ["--deep", name]
+    for line in extra.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        name, _, url = line.partition("=")
+        if not name.strip() or not url.strip().startswith("http"):
+            return f"Строка «{line}»: нужно ИМЯ=URL"
+        args += ["--endpoint", f"{name.strip()}={url.strip()}"]
+        if st.session_state.get("probe_deep_extra"):
+            args += ["--deep", name.strip()]
+    if raw:
+        args.append("--raw")
+    REPORTS_DIR.mkdir(exist_ok=True)
+    log = REPORTS_DIR / f"api_probe_run_{datetime.now():%Y%m%d_%H%M%S}.log"
+    pid = launch(args, log_path=log)
+    PROBE_STATE.write_text(json.dumps({"pid": pid, "started": datetime.now().isoformat(timespec="seconds"),
+                                       "log": str(log), "args": args[1:]}, ensure_ascii=False), encoding="utf-8")
+    return ""
+
+
+@st.fragment(run_every="2s")
+def probe_panel():
+    state = probe_state()
+    if not state:
+        st.caption("Исследование ещё не запускалось.")
+        return
+    seen = state["running"]
+    previous = st.session_state.get("probe_seen")
+    st.session_state["probe_seen"] = seen
+    if previous is not None and previous != seen:
+        st.rerun(scope="app")  # запуск закончился — включить кнопку и показать новый отчёт
+    log = tail(state.get("log"), 400)
+    requests = re.findall(r"\[(\d+) запр\.\]", log)
+    head = f"Запуск {state.get('started', '').replace('T', ' ')} · {duration(state.get('started'))}"
+    if state["running"]:
+        st.info(f"{head} · идёт" + (f" · запросов: {requests[-1]}" if requests else ""))
+    elif "login_fgis" in log:
+        st.warning("Сохранённый вход в ФГИС недействителен — нажмите «Войти в ФГИС» на вкладке «Запуск».")
+    elif "Готово:" in log:
+        st.success(f"{head} · готово")
+    else:
+        st.error(f"{head} · завершился без отчёта — см. журнал")
+    st.code("\n".join(log.splitlines()[-15:]) or "(журнал пуст)", language=None)
+
+
+def api_tab():
+    st.caption("Только чтение: GET/OPTIONS к gisopvk.ru с сохранённым входом, пауза между запросами. "
+               "Проверяет поля эндпоинтов, связи и какие sort/фильтры/include сервер применяет. "
+               "Обычно 5–15 минут.")
+    busy = current_state().get("status") == "running"
+    state = probe_state()
+    running = state.get("running", False)
+
+    with st.container(border=True):
+        names = list(api_probe.ENDPOINTS)
+        deep = st.multiselect("Проверка параметров (sort, фильтры, include, пагинация) для",
+                              names, default=api_probe.DEFAULT_DEEP)
+        extra = st.text_area("Дополнительные эндпоинты (по одному в строке: ИМЯ=URL)",
+                             placeholder="driver_task=https://gisopvk.ru/webapi/v1/driver_task/", height=80)
+        c1, c2, c3 = st.columns(3)
+        c1.checkbox("Проверять параметры и у дополнительных", key="probe_deep_extra")
+        raw = c2.checkbox("Без маскирования (телефоны, ФИО, ИНН — как есть)")
+        sample = c3.number_input("Записей в выборке", min_value=5, max_value=100, value=20, step=5)
+        b1, b2, b3 = st.columns([1, 1, 2])
+        if b1.button("🔎 Исследовать API", type="primary", disabled=running or busy,
+                     use_container_width=True):
+            error = start_probe(deep, extra, raw, int(sample))
+            if error:
+                b3.error(error)
+            else:
+                st.toast("Исследование API запущено")
+                st.rerun()
+        if running and b2.button("■ Остановить", use_container_width=True):
+            error = kill_tree(int(state["pid"]))
+            (b3.error(error) if error else st.toast("Остановлено"))
+            st.rerun()
+        if busy:
+            b3.caption("Идёт сценарий пайплайна — исследование можно запустить после него.")
+
+    probe_panel()
+
+    reports = probe_reports()
+    if not reports:
+        return
+    st.divider()
+    chosen = st.selectbox("Отчёт", reports, format_func=lambda p: p.name.replace("api_probe_", ""))
+    md, js = chosen / "report.md", chosen / "report.json"
+    d1, d2, d3 = st.columns(3)
+    if md.exists():
+        d1.download_button("⬇ report.md", md.read_bytes(), file_name=f"{chosen.name}.md",
+                           use_container_width=True)
+    if js.exists():
+        d2.download_button("⬇ report.json", js.read_bytes(), file_name=f"{chosen.name}.json",
+                           use_container_width=True)
+    d3.download_button("⬇ Всё (zip)", zip_folder(chosen), file_name=f"{chosen.name}.zip",
+                       use_container_width=True)
+    if md.exists():
+        with st.container(border=True, height=700):
+            st.markdown(md.read_text(encoding="utf-8"))
+    else:
+        st.caption("Отчёт ещё не записан.")
+
+
+# ---------------------------------------------------------------------------
 st.title("ФЭО: заказы ФГИС → Битрикс24")
-tab_run, tab_data, tab_audit = st.tabs(["Запуск", "Данные", "Журнал Битрикс"])
+tab_run, tab_data, tab_audit, tab_api = st.tabs(["Запуск", "Данные", "Журнал Битрикс", "API ФГИС"])
 with tab_run:
     run_tab()
 with tab_data:
     data_tab()
 with tab_audit:
     audit_tab()
+with tab_api:
+    api_tab()
