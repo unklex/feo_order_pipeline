@@ -10,7 +10,10 @@
     (attributes, relationships, included) по выборке: типы, доля пустых, длина, повторяющиеся значения;
     детальный ответ /<id>/ в сравнении со списком; куда ведут ссылки relationships;
   * для основных эндпоинтов (--deep): какие sort, фильтры (5 вариантов записи), include, fields[...]
-    и варианты пагинации сервер реально применяет, а какие молча игнорирует; время ответа от page[limit].
+    и варианты пагинации сервер реально применяет, а какие молча игнорирует; время ответа от page[limit];
+  * доступ к файлам: по одному примеру каждого вида ссылок на файлы из записей всех эндпоинтов (вложения
+    статусов, фото, подписанные документы, …) и документы из relationships (счета, УПД, акты — заказов
+    и переработки): отдаёт ли сервер файл, тип и размер. Читаются только первые 8 КБ, на диск не пишется.
 
     python api_probe.py                         # основные эндпоинты + найденные в корнях API
     python api_probe.py --deep order_transportation --deep stencil_bid
@@ -32,7 +35,7 @@ import time
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, parse_qsl, quote, urlparse
 
 from gisopvkwebapiparser import GisopvkWebApiParser
 from pipeline_common import EXIT_AUTH_REQUIRED, ROOT
@@ -56,6 +59,11 @@ ENDPOINTS = {
     "stencil_facility": f"{HOST}/stencilapi/v1/facility/",
     "stencil_vehicle": f"{HOST}/stencilapi/v1/vehicle/",
     "stencil_organization_info": f"{HOST}/stencilapi/v1/organization_info/",
+    # webapi-версии переработки и договоров (в stencilapi они есть; здесь — проверить, отдаёт ли webapi)
+    "order_recycling": f"{HOST}/webapi/v1/order_recycling/",
+    "contract_recycling": f"{HOST}/webapi/v1/contract_recycling/",
+    "contract_transportation": f"{HOST}/webapi/v1/contract_transportation/",
+    "driver_task": f"{HOST}/webapi/v1/driver_task/",
 }
 DEFAULT_DEEP = ["order_transportation", "stencil_bid"]
 
@@ -114,8 +122,59 @@ class Client:
             result["error"] = json.dumps(result["json"], ensure_ascii=False)[:400]
         return result
 
+    def peek(self, url: str, max_bytes: int = 8192) -> dict:
+        """GET файла: только заголовки и первые max_bytes, тело дальше не читается и не сохраняется."""
+        if self.count >= self.max_requests:
+            return {"url": url, "status": None, "error": "лимит запросов (--max-requests) исчерпан"}
+        self.count += 1
+        time.sleep(self.delay)
+        started = time.time()
+        try:
+            with self.session.get(url, timeout=self.timeout, stream=True) as r:
+                head = r.raw.read(max_bytes, decode_content=True) or b""
+                result = {"url": url, "status": r.status_code, "ms": int((time.time() - started) * 1000),
+                          "content_type": r.headers.get("Content-Type", ""),
+                          "size": r.headers.get("Content-Length"), "kind": sniff(head),
+                          "filename_ext": disposition_ext(r.headers.get("Content-Disposition", ""))}
+                if r.status_code >= 400 or result["kind"] in ("json", "html"):
+                    result["text"] = head[:300].decode("utf-8", errors="replace")
+                return result
+        except Exception as e:
+            return {"url": url, "status": None, "ms": int((time.time() - started) * 1000),
+                    "error": f"{type(e).__name__}: {e}"[:300]}
+
     def close(self):
         self.parser.close()
+
+
+MAGIC = [(b"%PDF", "pdf"), (b"\xff\xd8\xff", "jpeg"), (b"\x89PNG", "png"), (b"GIF8", "gif"),
+         (b"PK\x03\x04", "zip/docx/xlsx"), (b"\x30\x82", "der (подпись/сертификат)"),
+         (b"-----BEGIN", "pem"), (b"<?xml", "xml"), (b"RIFF", "riff/webp"), (b"II*\x00", "tiff"),
+         (b"MM\x00*", "tiff"), (b"\xd0\xcf\x11\xe0", "doc/xls (старый Office)")]
+
+
+def sniff(head: bytes) -> str:
+    """Тип файла по первым байтам."""
+    stripped = head.lstrip()
+    for magic, kind in MAGIC:
+        if head.startswith(magic) or stripped.startswith(magic):
+            return kind
+    if stripped[:1] in (b"{", b"["):
+        return "json"
+    if stripped[:15].lower().startswith((b"<!doctype", b"<html")):
+        return "html"
+    if re.match(rb"^[A-Za-z0-9+/=\r\n]{40,}$", stripped[:200]):
+        return "base64 (подпись?)"
+    return "другое" if head else "пусто"
+
+
+def disposition_ext(header: str) -> str:
+    """Только расширение имени файла: само имя может содержать ФИО или название организации."""
+    match = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", header or "", re.I)
+    if not match:
+        return ""
+    name = match.group(1)
+    return name.rsplit(".", 1)[-1].lower() if "." in name else "(без расширения)"
 
 
 def page(client, url, limit, offset=0, extra=None):
@@ -377,6 +436,7 @@ def probe_structure(client, name, url, sample, raw, out_dir: Path) -> dict:
 
     # Детальный ответ по одной записи: те же поля или больше?
     rec_id = rows[0].get("id")
+    drows = []
     if rec_id is not None:
         detail = client.request(f"{url}{rec_id}/")
         report["detail"] = summarize(detail)
@@ -396,7 +456,110 @@ def probe_structure(client, name, url, sample, raw, out_dir: Path) -> dict:
                             "types": dict(Counter(r.get("type") for r in rel_rows if isinstance(r, dict))),
                             "schema": field_schema(rel_rows[:10], raw) if rel_rows else None}
     report["related"] = related
+    report["_rows"] = rows + (drows if rec_id is not None else [])
     return report
+
+
+FILE_WORDS = re.compile(r"(file|photo|_dl\b|_dl/|download|print|thumbnail|/view/|\.(pdf|jpe?g|png|gif|xml|zip|"
+                        r"docx?|xlsx?|sig|p7s|tiff?)$)", re.I)
+
+
+def file_link_kind(link: str):
+    """(вид, полный url) для ссылки на файл; None — не файл. Вид — шаблон адреса без конкретных id."""
+    if not isinstance(link, str) or len(link) > 600 or " " in link.strip():
+        return None
+    url = link.strip()
+    if url.startswith("http"):
+        if not url.startswith(HOST):
+            return None
+    elif url.startswith("/"):
+        url = HOST + url
+    elif re.match(r"^(webapi|stencilapi|files|media)/", url):
+        url = f"{HOST}/{url}"
+    else:
+        return None
+    path, _, query = url[len(HOST):].partition("?")
+    if not FILE_WORDS.search(path) and not FILE_WORDS.search(query):
+        return None
+    if re.match(r"^/(webapi|stencilapi)/v\d+/[\w-]+/$", path) and not query:
+        return None  # список эндпоинта, не файл (у адресов скачивания вида .../sign_files_dl/ есть параметры)
+    template = re.sub(r"/\d+(?=/|$)", "/{n}", path)  # только id-сегменты, не «v1»
+    if path.startswith(("/files/", "/media/")):
+        template = path.split("/")[1] + "/…" + (("." + path.rsplit(".", 1)[-1].lower()) if "." in path else "")
+    params = dict(parse_qsl(query))
+    # resource_name и file_field_name различают виды файлов (подпись, печатная форма, доверенность, …)
+    named = [f"{k}={params[k]}" for k in ("resource_name", "file_field_name") if k in params]
+    rest = sorted(k for k in params if k not in ("resource_name", "file_field_name"))
+    return template + ("?" + "&".join(named + rest) if params else ""), url
+
+
+def collect_file_links(rows: list, source: str, found: dict):
+    """Добавляет в found по первому примеру каждого вида файловых ссылок из записей."""
+    def walk(value):
+        if isinstance(value, dict):
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+        else:
+            hit = file_link_kind(value)
+            if hit and hit[0] not in found:
+                found[hit[0]] = {"url": hit[1], "found_in": source}
+
+    walk(rows)
+
+
+def document_refs(rows: list) -> dict:
+    """{тип: id} документов и фото из relationships (по первому id каждого типа)."""
+    refs = {}
+    for r in rows:
+        for value in (r.get("relationships") or {}).values() if isinstance(r, dict) else []:
+            data = (value or {}).get("data")
+            for d in data if isinstance(data, list) else [data] if isinstance(data, dict) else []:
+                t = str(d.get("type") or "")
+                if d.get("id") and (t.startswith("document") or t in ("photo", "file", "claim")):
+                    refs.setdefault(t, str(d["id"]))
+    return refs
+
+
+def probe_files(client, rows_by_endpoint: dict) -> dict:
+    """Доступ к файлам: каждый вид ссылки из записей + документы из relationships."""
+    links, documents = {}, {}
+    for name, rows in rows_by_endpoint.items():
+        collect_file_links(rows, name, links)
+    refs = {}
+    for name, rows in rows_by_endpoint.items():
+        for t, i in document_refs(rows).items():
+            refs.setdefault(t, (i, name))
+
+    for t, (doc_id, source) in sorted(refs.items()):
+        if t in ("photo", "file"):
+            # у фото и файлов есть прямые адреса просмотра — проверяем их как ссылки
+            for suffix in ("view/", "thumbnail/") if t == "photo" else ("view/",):
+                hit = file_link_kind(f"{HOST}/webapi/v1/{t}/{doc_id}/{suffix}")
+                if hit and hit[0] not in links:
+                    links[hit[0]] = {"url": hit[1], "found_in": f"{source} (relationships)"}
+            continue
+        print(f"    документ {t}…", flush=True)
+        resp = client.request(f"{HOST}/webapi/v1/{t}/{doc_id}/")
+        entry = {**summarize(resp), "found_in": source, "id": doc_id}
+        body = resp.get("json") if isinstance(resp.get("json"), dict) else {}
+        data = body.get("data") if isinstance(body.get("data"), dict) else {}
+        if data:
+            entry["attributes"] = sorted((data.get("attributes") or {}).keys())[:60]
+            inner = {}
+            collect_file_links([body], f"{t}/{doc_id}", inner)
+            entry["file_links"] = sorted(inner)
+            for kind, info in inner.items():
+                links.setdefault(kind, info)
+        documents[t] = entry
+
+    checked = {}
+    for kind, info in sorted(links.items()):
+        print(f"    файл {kind}…", flush=True)
+        checked[kind] = {**client.peek(info["url"]), "found_in": info["found_in"]}
+    return {"links": checked, "documents": documents}
 
 
 def verdict_sort(resp, base_ids, field):
@@ -529,6 +692,25 @@ def write_markdown(report: dict, path: Path):
         lines += ["", f"Найдено в корнях ({len(report['discovery']['found'])}): "
                   + ", ".join(sorted(report["discovery"]["found"]))]
 
+    files = report.get("files") or {}
+    if files.get("links") or files.get("documents"):
+        lines += ["", "## Доступ к файлам", "", "Читались только первые 8 КБ каждого файла.", "",
+                  "| вид ссылки | где найдена | статус | тип по содержимому | Content-Type | размер | имя файла |",
+                  "|---|---|---|---|---|---|---|"]
+        for kind, f in files.get("links", {}).items():
+            size = f.get("size")
+            lines.append(f"| `{kind}` | {f.get('found_in')} | {f.get('status')} {f.get('error', '')[:60]} | "
+                         f"{f.get('kind', '')} | {f.get('content_type', '')} | "
+                         f"{(str(round(int(size) / 1024)) + ' КБ') if size and str(size).isdigit() else ''} | "
+                         f"{'.' + f['filename_ext'] if f.get('filename_ext') else ''} |")
+        if files.get("documents"):
+            lines += ["", "Документы из relationships (детальная запись /webapi/v1/<тип>/<id>/):", "",
+                      "| тип | где найден | статус | ссылки на файлы внутри | поля |", "|---|---|---|---|---|"]
+            for t, d in files["documents"].items():
+                lines.append(f"| `{t}` | {d.get('found_in')} | {d.get('status')} | "
+                             f"{', '.join(f'`{k}`' for k in d.get('file_links', [])) or '—'} | "
+                             f"{', '.join(d.get('attributes', [])[:12])} |")
+
     lines += ["", "## Эндпоинты", "", "| имя | статус | мс | записей всего | полей | связи |", "|---|---|---|---|---|---|"]
     for name, e in report["endpoints"].items():
         lst = e.get("list", {})
@@ -587,6 +769,7 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=90, help="Таймаут запроса, с.")
     ap.add_argument("--max-requests", type=int, default=1500, help="Предел запросов за запуск.")
     ap.add_argument("--raw", action="store_true", help="Не маскировать примеры значений.")
+    ap.add_argument("--no-files", action="store_true", help="Не проверять доступ к файлам.")
     args = ap.parse_args()
 
     endpoints = dict(ENDPOINTS)
@@ -621,15 +804,21 @@ def main() -> int:
                     endpoints.setdefault(name, url)
 
         discovered = set(report["discovery"]["found"]) - set(ENDPOINTS)
+        rows_by_endpoint = {}
         for name, url in endpoints.items():
             print(f"[{client.count} запр.] {name}: {url}", flush=True)
             sample = min(args.sample, 5) if name in discovered and name not in deep else args.sample
             entry = probe_structure(client, name, url, sample, args.raw, out_dir)
+            rows_by_endpoint[name] = entry.pop("_rows", [])
             if name in deep and entry.get("schema"):
                 print(f"    параметры {name}...", flush=True)
                 rows = records(page(client, url, args.sample))
                 entry["params"] = probe_params(client, url, rows, args.limit)
             report["endpoints"][name] = entry
+
+        if not args.no_files:
+            print(f"[{client.count} запр.] Доступ к файлам…", flush=True)
+            report["files"] = probe_files(client, rows_by_endpoint)
     except KeyboardInterrupt:
         print("Прервано — сохраняю то, что успели собрать.", flush=True)
     finally:

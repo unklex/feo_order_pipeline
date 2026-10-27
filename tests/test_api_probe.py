@@ -109,3 +109,59 @@ def test_stencil_params_use_flat_fields():
     out = ap.probe_params(client, URL, rows, limit=5)
     assert "dt_update" in out["sort"] and "-dt_update" in out["sort"]
     assert any(k.startswith("filter[dt_update__gte]") for k in out["filter"])
+
+
+def test_file_link_kinds_from_real_shapes():
+    h = "https://gisopvk.ru"
+    cases = {
+        f"{h}/webapi/v1/file/3586215/view/": "/webapi/v1/file/{n}/view/",
+        f"{h}/webapi/v1/photo/371217/thumbnail/": "/webapi/v1/photo/{n}/thumbnail/",
+        "webapi/v1/sign_files_dl/?resource_name=bid&obj_id=327398&file_field_name=sign_print_form":
+            "/webapi/v1/sign_files_dl/?resource_name=bid&file_field_name=sign_print_form&obj_id",
+        "webapi/v1/status_history_file_dl/?resource_name=bid&obj_id=327389&file_id=3586215":
+            "/webapi/v1/status_history_file_dl/?resource_name=bid&file_id&obj_id",
+        "files/photo/4/3/d/43dd0b40950a948d.снимок.png": "files/….png",
+    }
+    for link, kind in cases.items():
+        assert ap.file_link_kind(link)[0] == kind, link
+    for not_file in (f"{h}/webapi/v1/vehicle/", "https://other.ru/file/1/view/", "Заказ ID: 5", "photo"):
+        assert ap.file_link_kind(not_file) is None, not_file
+
+
+def test_sniff_and_disposition():
+    assert ap.sniff(b"%PDF-1.7\n...") == "pdf"
+    assert ap.sniff(b"\xff\xd8\xff\xe0JFIF") == "jpeg"
+    assert ap.sniff(b'{"errors": []}') == "json"
+    assert ap.sniff(b"<!DOCTYPE html><html>") == "html"
+    assert ap.disposition_ext('attachment; filename="Счёт Иванов.PDF"') == "pdf"
+    assert ap.disposition_ext("attachment; filename*=UTF-8''%D0%B0.xml") == "xml"
+
+
+def test_probe_files_documents_and_links():
+    rows = {"order_transportation": [{
+        "relationships": {"documents_invoice": {"data": [{"type": "document_invoice_order_transportation",
+                                                          "id": "55337"}]},
+                          "photos": {"data": [{"type": "photo", "id": "9"}]}},
+        "attributes": {"status_history": [{"files": [{"url": "https://gisopvk.ru/webapi/v1/file/1/view/"}]}]}}],
+        "order_recycling": [{"meta": {"signatures": [{"sign_file":
+            "webapi/v1/sign_files_dl/?resource_name=order_recycling&obj_id=3&file_field_name=sign_file"}]}}]}
+
+    class C:
+        count = 0
+
+        def request(self, url, params=None, method="GET"):
+            assert url.endswith("/webapi/v1/document_invoice_order_transportation/55337/")
+            return {"status": 200, "json": {"data": {"attributes": {"number": "1", "file_pdf":
+                                                                     "/webapi/v1/document_file_dl/?id=55337"}}}}
+
+        def peek(self, url, max_bytes=8192):
+            return {"url": url, "status": 200, "kind": "pdf", "content_type": "application/pdf", "size": "2048"}
+
+    out = ap.probe_files(C(), rows)
+    kinds = set(out["links"])
+    assert "/webapi/v1/file/{n}/view/" in kinds
+    assert "/webapi/v1/photo/{n}/view/" in kinds and "/webapi/v1/photo/{n}/thumbnail/" in kinds
+    assert "/webapi/v1/sign_files_dl/?resource_name=order_recycling&file_field_name=sign_file&obj_id" in kinds
+    assert "/webapi/v1/document_file_dl/?id" in kinds
+    doc = out["documents"]["document_invoice_order_transportation"]
+    assert doc["status"] == 200 and doc["file_links"] == ["/webapi/v1/document_file_dl/?id"]
