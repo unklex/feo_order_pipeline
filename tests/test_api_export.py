@@ -1,6 +1,7 @@
 import csv
 import gzip
 import json
+import re
 
 import api_export as ax
 
@@ -48,7 +49,7 @@ def test_export_finds_endpoint_pages_and_writes(tmp_path):
     with gzip.open(out / "records.jsonl.gz", "rt", encoding="utf-8") as f:
         ids = [json.loads(line)["id"] for line in f]
     assert len(ids) == len(set(ids)) == 118  # повторы на стыке отброшены (а 2 записи «сдвинулись» за конец)
-    rows = list(csv.DictReader(open(out / "records.csv", encoding="utf-8-sig")))
+    rows = list(csv.DictReader(open(out / "records.csv", encoding="utf-8-sig"), delimiter=";"))
     first = rows[0]
     assert first["fio"] == "Водитель 1" and first["license.number"] == "771"
     assert first["categories"] == '["C", "E"]'
@@ -97,7 +98,28 @@ def test_excel_formula_cells_are_neutralised(tmp_path):
             return Resp(404)
 
     out = ax.export(ax.Fetcher(Evil(), delay=0), "drivers", ax.DATASETS["drivers"][1], tmp_path)
-    header, row = list(csv.reader(open(out / "records.csv", encoding="utf-8-sig")))
+    header, row = list(csv.reader(open(out / "records.csv", encoding="utf-8-sig"), delimiter=";"))
     assert "'=bad" in header
     values = dict(zip(header, row))
     assert values["fio"] == "'=1+1" and values["phone"] == "+79001234567"
+
+
+def test_csv_is_not_split_inside_values(tmp_path):
+    """Русский Excel делит по «;» — значение с «;=…» внутри должно остаться одной ячейкой."""
+    class Evil(Session):
+        def get(self, url, params=None, timeout=None, allow_redirects=True):
+            if url.endswith("/driver/"):
+                return Resp(200, {"data": [{"id": "1", "attributes": {"fio": 'Иванов;=HYPERLINK("http://evil")',
+                                                                       "note": "a,=1+1"}}],
+                                  "meta": {"pagination": {"count": 1}}})
+            return Resp(404)
+
+    out = ax.export(ax.Fetcher(Evil(), delay=0), "drivers", ax.DATASETS["drivers"][1], tmp_path)
+    line = (out / "records.csv").read_text(encoding="utf-8-sig").splitlines()[1]
+    # все поля в кавычках, между ними «;»: разделитель вне кавычек — только между полями
+    assert line.startswith('"') and line.endswith('"')
+    outside_quotes = re.sub(r'"(?:[^"]|"")*"', "", line)
+    assert set(outside_quotes) <= {";"}
+    header, row = list(csv.reader(open(out / "records.csv", encoding="utf-8-sig"), delimiter=";"))
+    values = dict(zip(header, row))
+    assert values["fio"] == 'Иванов;=HYPERLINK("http://evil")' and values["note"] == "a,=1+1"

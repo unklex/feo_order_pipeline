@@ -791,7 +791,7 @@ def export_tab():
     if raw_path.exists():
         d2.download_button("⬇ JSONL (всё как в API)", raw_path.read_bytes(), file_name=f"{chosen.name}.jsonl.gz",
                            use_container_width=True)
-    df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+    df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig", sep=api_export.CSV_DELIMITER)
     st.caption(f"{len(df)} записей, {len(df.columns)} колонок · папка `{chosen}`")
     st.dataframe(df.head(500), hide_index=True, use_container_width=True, height=420)
 

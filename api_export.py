@@ -12,7 +12,7 @@ webapi отдаёт данные своей организации (ЭКОПРО
 Результат: exports/<имя>_<время>/
     records.jsonl.gz  — записи как есть (по одной в строке)
     records.csv       — плоская таблица: id + атрибуты (вложенные — через точку; списки — JSON),
-                        UTF-8 с BOM — открывается в Excel
+                        UTF-8 с BOM, разделитель «;», все поля в кавычках — для русского Excel
     info.json         — адрес, число записей, время
 Файлы содержат личные данные (ФИО, телефоны, документы водителей): папка exports/ в git не попадает.
 
@@ -73,6 +73,7 @@ def flatten(record: dict) -> dict:
     return row
 
 
+CSV_DELIMITER = ";"
 FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
 PLAIN_NUMBER = re.compile(r"^[+-]?[\d\s().,-]+$")  # телефоны, суммы: формулой не станут
 
@@ -166,7 +167,9 @@ def export(fetcher: Fetcher, name: str, candidates: list, out_root: Path) -> Pat
 
     columns = list(dict.fromkeys(k for row in rows for k in row))
     with open(out / "records.csv", "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.writer(f)
+        # «;» — разделитель русского Excel; каждое поле в кавычках, чтобы Excel не делил значение
+        # по «;» или «,» внутри него (иначе кусок после разделителя стал бы отдельной ячейкой-формулой)
+        w = csv.writer(f, delimiter=CSV_DELIMITER, quoting=csv.QUOTE_ALL)
         w.writerow([excel_safe(c) for c in columns])
         for row in rows:
             w.writerow([excel_safe(row.get(c)) for c in columns])
