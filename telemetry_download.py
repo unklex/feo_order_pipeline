@@ -16,6 +16,12 @@
 повторы при 429/5xx. Повторный запуск докачивает только недостающее (done.txt — тот же формат, что у
 opvk-export, поэтому его папки тоже можно докачивать).
 
+Быстрее, чем opvk-export, за счёт пустых дней (их большинство):
+  * у каждой машины период обрезается датой её последней телеметрии из списка ТС (+1 день запаса);
+  * сначала одним запросом проверяется блок из --probe-days суток (30): пусто — все его сутки отмечаются
+    готовыми, есть точки — блок скачивается по суткам как обычно. Перед этим проверка калибруется на
+    машине с данными: если сервер на длинном окне ответил пусто там, где точки есть, блоки отключаются.
+
 Результат в папке --out:
     telemetry_<время запуска>.csv.gz  — точки этого запуска: vehicle_id, plate, tracker_id, date_time,
                                          lat, lon, speed, course, sat, telemetry_state
@@ -39,6 +45,7 @@ import sys
 import threading
 import time
 import zlib
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -58,6 +65,8 @@ POINT_FIELDS = ["vehicle_id", "plate", "tracker_id", "date_time", "lat", "lon", 
 VEHICLE_FIELDS = ["vehicle_id", "tracker_id", "imei", "plate", "brand", "model", "telemetry_last_date",
                   "telemetry_status"]
 MIN_SPLIT_SECONDS = 600
+BISECT_MIN_DAYS = 7
+DAY = 86400
 PROGRESS_EVERY = 50
 
 
@@ -200,16 +209,87 @@ def fetch_range(api: Api, vehicle: dict, start: int, end: int, split_at: int) ->
     return dedup(pts)
 
 
+def count_points(api: Api, vehicle: dict, start: int, end: int) -> int:
+    """Сколько точек сервер отдаёт за [start, end] одним запросом (для проверки блока на пустоту)."""
+    return len(point_list(api.get_json(TELEMETRY_URL, {
+        "tracker_id_set": vehicle["tracker_id"], "vehicle_id": vehicle["vehicle_id"],
+        "timestamp_from": start, "timestamp_to": end, "query": ""})))
+
+
+def make_work(jobs: list, probe_days: int) -> list:
+    """Задания -> работа: ("probe", v, [задания подряд идущих суток]) или ("job", (v, s, e)).
+
+    Блок — до probe_days соседних суток одной машины; одиночные сутки проверять незачем.
+    """
+    work, block = [], []
+
+    def flush():
+        if len(block) > 1:
+            work.append(("probe", block[0][0], list(block)))
+        elif block:
+            work.append(("job", block[0]))
+        block.clear()
+
+    for job in jobs:
+        v, s, e = job
+        contiguous = block and block[-1][0] is v and block[-1][2] + 1 == s
+        if not contiguous or len(block) >= probe_days:
+            flush()
+        block.append(job)
+    flush()
+    return work if probe_days > 1 else [("job", j) for j in jobs]
+
+
+def probing_reliable(api: Api, vehicles: list, probe_days: int, done_keys: set) -> bool:
+    """Отдаёт ли сервер точки на окне в probe_days суток там, где они точно есть.
+
+    Берём машину с самой свежей телеметрией и блок, заканчивающийся днём её последней телеметрии:
+    если за последний день точки есть, а за весь блок — «пусто», блоками пользоваться нельзя.
+    """
+    candidates = sorted((v for v in vehicles if last_telemetry_day(v)), key=last_telemetry_day, reverse=True)
+    for v in candidates[:3]:
+        last = last_telemetry_day(v)
+        day_start = int(datetime(last.year, last.month, last.day, tzinfo=timezone.utc).timestamp())
+        day_end = day_start + DAY - 1
+        try:
+            if count_points(api, v, day_start, day_end) == 0:
+                continue  # в «последний день» точек нет — машина не подходит для проверки
+            ok = count_points(api, v, day_end + 1 - probe_days * DAY, day_end) > 0
+        except (AuthError, BlockedError):
+            raise
+        except Exception as e:
+            logger.warning(f"Проверка блоков: {e} — блоки отключены")
+            return False
+        logger.info(f"Проверка блоков на ТС {v['vehicle_id']}: {'работает' if ok else 'НЕ работает — по суткам'}")
+        return ok
+    logger.info("Проверка блоков: нет машины с точками в день последней телеметрии — блоки отключены")
+    return False
+
+
 def job_key(vehicle_id: str, start: int, end: int) -> str:
     return f"{vehicle_id}|{start}|{end}"
 
 
+def last_telemetry_day(vehicle: dict):
+    """Дата (UTC) последней телеметрии машины из списка ТС или None."""
+    value = vehicle.get("telemetry_last_date") or ""
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (dt.astimezone(timezone.utc) if dt.tzinfo else dt).date()
+
+
 def make_jobs(vehicles: list, day_from: date, day_to: date, window: timedelta, done: set) -> list:
-    """Окна [s, e-1] по суткам UTC от day_from до конца day_to, кроме уже скачанных."""
+    """Окна [s, e-1] по суткам UTC от day_from до конца day_to, кроме уже скачанных.
+
+    vehicle["_day_to"], если задан, ограничивает период этой машины (дата последней телеметрии).
+    """
     start = datetime(day_from.year, day_from.month, day_from.day, tzinfo=timezone.utc)
-    stop = datetime(day_to.year, day_to.month, day_to.day, tzinfo=timezone.utc) + timedelta(days=1)
     jobs = []
     for v in vehicles:
+        last = min(day_to, v.get("_day_to") or day_to)
+        stop = datetime(last.year, last.month, last.day, tzinfo=timezone.utc) + timedelta(days=1)
         s = start
         while s < stop:
             e = min(s + window, stop)
@@ -370,22 +450,35 @@ def run(api: Api, args) -> int:
     selected = [v for v in vehicles if v["tracker_id"]
                 and (v["vehicle_id"] in only if only else (args.all_vehicles or v["telemetry_last_date"]))]
 
+    if not args.no_last_date_cut:
+        for v in selected:
+            last = last_telemetry_day(v)
+            if last:
+                v["_day_to"] = last + timedelta(days=1)  # запас на расхождение часовых поясов
+
     done_path = out / "done.txt"
     done = set(done_path.read_text(encoding="utf-8").split()) if done_path.exists() else set()
     jobs = make_jobs(selected, args.day_from, args.day_to, timedelta(hours=args.window_hours), done)
-    eta_h = len(jobs) / args.rps / 3600
+    probe_days = args.probe_days if args.window_hours == 24 else 0
+    work = make_work(jobs, probe_days)
+    blocks = sum(1 for w in work if w[0] == "probe")
     logger.info(f"ТС в ФГИС: {len(vehicles)}, к выгрузке: {len(selected)}, заданий: {len(jobs)} "
-                f"(уже готово: {len(done)}); не меньше {eta_h:.1f} ч при {args.rps} запр/с "
-                f"(насыщенные окна дробятся — запросов будет больше)")
+                f"(уже готово: {len(done)}); блоков по {probe_days} сут.: {blocks}; "
+                f"запросов без пустых дней не больше {len(work)} — от {len(work) / args.rps / 3600:.1f} ч "
+                f"при {args.rps} запр/с")
     if args.dry_run or not jobs:
         logger.info(f"Список ТС: {out / 'vehicles.csv'}")
         return 0
+    if blocks and not probing_reliable(api, selected, probe_days, done):
+        work = [("job", j) for j in jobs]
+        blocks = 0
 
     part = out / f"telemetry_{datetime.now():%Y%m%d_%H%M%S}.csv.gz"
-    failed = finished = points = 0
+    failed = finished = points = empty_by_probe = 0
     auth_error = None
     run_stats = {}
-    pending_jobs = iter(jobs)
+    pending_work = iter(work)
+    expanded = deque()  # работа из непустых блоков (половинки или сутки) — идёт вперёд очереди
     with gzip.open(part, "wt", encoding="utf-8", newline="") as gz, open(done_path, "a", encoding="utf-8") as df:
         writer = csv.writer(gz)
         writer.writerow(POINT_FIELDS)
@@ -395,17 +488,51 @@ def run(api: Api, args) -> int:
             def submit_more():
                 # в очереди не больше нескольких заданий на поток: окон бывают сотни тысяч
                 while len(in_flight) < args.workers * 3 and not api.stop.is_set():
-                    job = next(pending_jobs, None)
-                    if job is None:
+                    item = expanded.popleft() if expanded else next(pending_work, None)
+                    if item is None:
                         return
-                    in_flight[pool.submit(fetch_range, api, *job, args.split_at)] = job
+                    if item[0] == "probe":
+                        _, v, days = item
+                        fut = pool.submit(count_points, api, v, days[0][1], days[-1][2])
+                    else:
+                        fut = pool.submit(fetch_range, api, *item[1], args.split_at)
+                    in_flight[fut] = item
 
+            def mark_done(v, s, e):
+                df.write(job_key(v["vehicle_id"], s, e) + "\n")
+
+            last_logged = 0
             try:
                 submit_more()
                 while in_flight:
                     ready, _ = wait(in_flight, return_when=FIRST_COMPLETED)
                     for fut in ready:
-                        v, s, e = in_flight.pop(fut)
+                        item = in_flight.pop(fut)
+                        if item[0] == "probe":
+                            _, v, days = item
+                            try:
+                                count = fut.result()
+                            except (AuthError, BlockedError) as err:
+                                auth_error = auth_error or err
+                                api.stop.set()
+                                continue
+                            except Exception:
+                                count = None  # длинное окно не прошло — блок качаем по суткам
+                            if count == 0:
+                                for job in days:
+                                    mark_done(*job)
+                                df.flush()
+                                finished += len(days)
+                                empty_by_probe += len(days)
+                            elif count and len(days) > BISECT_MIN_DAYS:
+                                # есть точки: делим блок пополам и проверяем половинки — машина обычно
+                                # ездит не каждый день; до недели, дальше по суткам дешевле
+                                half = len(days) // 2
+                                expanded.extend([("probe", v, days[:half]), ("probe", v, days[half:])])
+                            else:
+                                expanded.extend(("job", job) for job in days)
+                            continue
+                        v, s, e = item[1]
                         try:
                             pts = fut.result()
                         except (AuthError, BlockedError) as err:
@@ -427,12 +554,14 @@ def run(api: Api, args) -> int:
                             writer.writerow(row)
                             add_point(run_stats, row)
                         gz.flush()  # точки на диске до отметки в done.txt
-                        df.write(job_key(v["vehicle_id"], s, e) + "\n")
+                        mark_done(v, s, e)
                         df.flush()
                         finished += 1
                         points += len(pts)
-                        if finished % PROGRESS_EVERY == 0 or finished == len(jobs):
-                            logger.info(f"готово {finished}/{len(jobs)} заданий, точек в этом запуске: {points}")
+                    if finished // PROGRESS_EVERY != last_logged // PROGRESS_EVERY or finished == len(jobs):
+                        last_logged = finished
+                        logger.info(f"готово {finished}/{len(jobs)} заданий, точек в этом запуске: {points}"
+                                    + (f", пустых сразу по блоку: {empty_by_probe}" if blocks else ""))
                     submit_more()
             except KeyboardInterrupt:
                 api.stop.set()
@@ -446,8 +575,8 @@ def run(api: Api, args) -> int:
     stats = read_summary(out)
     merge_stats(stats, run_stats)
     write_summary(out, stats)
-    logger.info(f"Итого: точек {points}, заданий с ошибкой {failed}; машин с точками всего {len(stats)}; "
-                f"папка {out}")
+    logger.info(f"Итого: точек {points}, заданий с ошибкой {failed}; пустых суток по блокам {empty_by_probe}; "
+                f"машин с точками всего {len(stats)}; папка {out}")
     if auth_error:
         logger.error(f"Остановлено: {auth_error}. Нужен вход в ФГИС (python login_fgis.py) — "
                      f"затем тот же запуск продолжит с места остановки.")
@@ -469,14 +598,20 @@ def main() -> int:
     ap.add_argument("--all-vehicles", action="store_true", help="И ТС, у которых никогда не было телеметрии.")
     ap.add_argument("--vehicles", default="", help="Только эти vehicle_id через запятую.")
     ap.add_argument("--workers", type=int, default=4, help="Параллельных запросов (по умолчанию 4).")
-    ap.add_argument("--rps", type=float, default=5, help="Запросов в секунду, всего (по умолчанию 5).")
+    ap.add_argument("--rps", type=float, default=5, help="Запросов в секунду, всего (по умолчанию 5, не больше 10).")
     ap.add_argument("--window-hours", type=int, default=24, help="Окно запроса, часов (по умолчанию 24).")
     ap.add_argument("--rebuild-summary", action="store_true", help="Пересчитать summary.csv по всем частям.")
+    ap.add_argument("--probe-days", type=int, default=30,
+                    help="Проверять пустоту блоками по столько суток (по умолчанию 30; 0 — не проверять).")
+    ap.add_argument("--no-last-date-cut", action="store_true",
+                    help="Не обрезать период машины датой её последней телеметрии.")
     ap.add_argument("--split-at", type=int, default=3000,
                     help="Если в ответе столько точек — делить окно пополам, до 10 минут (по умолчанию 3000).")
     args = ap.parse_args()
     if args.day_from > args.day_to:
         ap.error("--from позже --to")
+    if not 0 < args.rps <= 10:
+        ap.error("--rps от 0 до 10: портал государственный, сильнее нагружать его не стоит")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
     parser = GisopvkWebApiParser(base_url=VEHICLE_URL)

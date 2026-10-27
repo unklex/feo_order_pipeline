@@ -666,9 +666,10 @@ def telemetry_results(folder: Path):
 
 
 def telemetry_tab():
-    st.caption("Только чтение: история точек ТС из ФГИС (/webapi/v1/tracking/telemetry/) с сохранённым входом, "
-               "до 5 запросов в секунду. Окна по суткам, насыщенные дробятся до 10 минут, повторы точек "
-               "убираются. Остановить можно в любой момент — повторный запуск докачает только недостающее.")
+    st.caption("Только чтение: история точек ТС из ФГИС (/webapi/v1/tracking/telemetry/) с сохранённым входом. "
+               "Пустые дни пропускаются быстро: период машины обрезается датой её последней телеметрии, а месяц "
+               "без точек проверяется одним запросом. Остановить можно в любой момент — повторный запуск "
+               "докачает только недостающее (и продолжит прошлую выгрузку в той же папке).")
     state = bg_state("telemetry")
     running = state.get("running", False)
     busy = busy_reason() if not running else ""
@@ -679,13 +680,16 @@ def telemetry_tab():
         day_to = c2.date_input("По (включительно)", value=datetime.now().date(), format="DD.MM.YYYY")
         out = c3.text_input("Папка результата", value=default_telemetry_dir(),
                             help="На диске с запасом места: за весь период это десятки ГБ.")
-        c4, c5 = st.columns([1, 2])
+        c4, c5, c6 = st.columns([1, 2, 1])
         all_vehicles = c4.checkbox("И машины без телеметрии", help="По умолчанию — только те, у кого она была.")
         only = c5.text_input("Только эти vehicle_id (через запятую)", placeholder="10469, 10566",
                              help="Для проверки на одной-двух машинах.")
+        rps = c6.number_input("Запросов в секунду", min_value=1, max_value=10, value=5,
+                              help="Нагрузка на портал ФГИС. Больше 5 — только если не приходят ошибки 429.")
         b1, b2, b3, b4 = st.columns([1, 1, 1, 2])
         base = ["telemetry_download.py", "--from", f"{day_from:%Y-%m-%d}", "--to", f"{day_to:%Y-%m-%d}",
                 "--out", out.strip()]
+        base += ["--rps", str(int(rps))]
         base += ["--all-vehicles"] if all_vehicles else []
         base += ["--vehicles", only.replace(" ", "")] if only.strip() else []
         error = ""
