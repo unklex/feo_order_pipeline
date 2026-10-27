@@ -74,3 +74,38 @@ def test_structure_masks_and_reports(tmp_path):
 def test_total_from_last_link():
     resp = {"json": {"data": [], "links": {"last": f"{URL}?page%5Blimit%5D=20&page%5Boffset%5D=3520"}}}
     assert ap.total(resp) == "last_offset=3520"
+
+
+def test_stencil_results_format():
+    resp = {"json": {"results": [{"id": 7, "dt_update": "2026-10-01T10:00:00+03:00", "status_label": "x"}],
+                     "meta": {"pagination": {"count": 326843}}, "links": {}}}
+    assert ap.records(resp)[0]["id"] == 7
+    assert ap.total(resp) == 326843
+    assert ap.attr(ap.records(resp)[0], "dt_update").startswith("2026-10-01")
+
+
+def test_root_links_any_shape():
+    root = "https://gisopvk.ru/webapi/v1/"
+    body = {"data": {
+        "bid": "https://gisopvk.ru/webapi/v1/bid/",
+        "vehicle": "/webapi/v1/vehicle/?page[limit]=20",
+        "nested": {"driver_task": {"url": "https://gisopvk.ru/webapi/v1/driver_task/"}},
+        "items": [{"type": "fkko", "links": {"self": "/stencilapi/v1/fkko/"}}],
+        "self": root,
+        "not_api": "https://gisopvk.ru/files/x.png",
+        "text": "Просто строка",
+    }}
+    assert ap.root_links(body, root) == {
+        "bid": "https://gisopvk.ru/webapi/v1/bid/",
+        "vehicle": "https://gisopvk.ru/webapi/v1/vehicle/",
+        "driver_task": "https://gisopvk.ru/webapi/v1/driver_task/",
+        "stencil_fkko": "https://gisopvk.ru/stencilapi/v1/fkko/",
+    }
+
+
+def test_stencil_params_use_flat_fields():
+    rows = [{"id": i, "dt_update": f"{RECENT}T10:00:00+03:00", "status_label": "a"} for i in range(1, 6)]
+    client = FakeClient()
+    out = ap.probe_params(client, URL, rows, limit=5)
+    assert "dt_update" in out["sort"] and "-dt_update" in out["sort"]
+    assert any(k.startswith("filter[dt_update__gte]") for k in out["filter"])

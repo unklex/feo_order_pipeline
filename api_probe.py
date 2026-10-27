@@ -70,7 +70,8 @@ SCHEMA_URLS = [
 SENSITIVE = re.compile(r"phone|tel|mail|fio|name|inn|snils|passport|contact|address|author|driver|"
                        r"login|user|person|comment|note|kpp|ogrn|bank|account|plate|imei", re.I)
 DATE_FIELD = re.compile(r"(^dt_|_dt$|_date$|^date_|_at$|^date$)", re.I)
-MAX_DISCOVERED = 60
+MAX_DISCOVERED = 200
+API_PATH = re.compile(r"^(?:https?://[^/]+)?/(?:webapi|stencilapi)/v\d+/[\w./-]+$")
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +126,11 @@ def page(client, url, limit, offset=0, extra=None):
 # Разбор ответа
 # ---------------------------------------------------------------------------
 def records(resp) -> list:
-    data = (resp.get("json") or {}).get("data") if isinstance(resp.get("json"), dict) else None
+    """Записи ответа: JSON:API ("data"), stencilapi ("results", плоские объекты) или голый список."""
+    body = resp.get("json") if isinstance(resp.get("json"), dict) else {}
+    if isinstance(body.get("results"), list):
+        return body["results"]
+    data = body.get("data")
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
@@ -254,20 +259,64 @@ def summarize(resp) -> dict:
     return out
 
 
-def discover_roots(client) -> dict:
+def root_links(body, root_url: str) -> dict:
+    """{имя: url} из ответа корня API любой формы: {"имя": url}, {"data": {...}}, списки, вложенные links.
+
+    Имя — ключ, под которым лежит ссылка; для url/href/self/related внутри объекта — его name/type/id
+    или ключ родителя. Относительные пути (/webapi/v1/x/) дополняются адресом портала.
+    """
+    found = {}
+
+    def add(name, link):
+        if not isinstance(link, str) or not API_PATH.match(link.split("?")[0]):
+            return
+        link = link if link.startswith("http") else HOST + link
+        link = link.split("?")[0]
+        link = link if link.endswith("/") else link + "/"
+        if link.rstrip("/") == root_url.rstrip("/"):
+            return
+        name = str(name or link.rstrip("/").rsplit("/", 1)[-1])
+        found.setdefault(("stencil_" if "/stencilapi/" in link else "") + name, link)
+
+    def walk(value, parent_key):
+        if isinstance(value, dict):
+            label = value.get("name") or value.get("type") or value.get("id") or parent_key
+            for key, item in value.items():
+                if isinstance(item, str):
+                    add(label if key in ("url", "href", "self", "related", "link") else key, item)
+                else:
+                    # обёртки JSON:API не именуют эндпоинт — имя берём у объекта выше
+                    walk(item, label if key in ("links", "attributes", "data", "meta") else key)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    add(None, item)
+                else:
+                    walk(item, parent_key)
+
+    walk(body, None)
+    return found
+
+
+def discover_roots(client, out_dir: Path) -> dict:
     found, results = {}, {}
     for url in API_ROOTS:
         resp = client.request(url)
         results[url] = summarize(resp)
         body = resp.get("json")
-        if resp.get("status") == 200 and isinstance(body, dict):
-            results[url]["keys"] = list(body)[:80]
-            # DRF-корень: {"name": "https://.../name/"}; JSON:API — то же внутри links
-            links = body.get("links") if isinstance(body.get("links"), dict) else body
-            for name, link in links.items():
-                if isinstance(link, str) and link.startswith("http") and link.rstrip("/") != url.rstrip("/"):
-                    prefix = "stencil_" if "/stencilapi/" in link else ""
-                    found.setdefault(prefix + name, link if link.endswith("/") else link + "/")
+        if resp.get("status") == 200 and isinstance(body, (dict, list)):
+            if isinstance(body, dict):
+                results[url]["keys"] = list(body)[:80]
+            # Ответ корня целиком — список эндпоинтов, личных данных в нём нет
+            name = re.sub(r"[^a-z0-9]+", "_", url.replace(HOST, "").lower()).strip("_")
+            path = out_dir / "roots" / f"{name}.json"
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(json.dumps(body, ensure_ascii=False, indent=1), encoding="utf-8")
+            results[url]["saved"] = str(path.relative_to(out_dir))
+            links = root_links(body, url)
+            results[url]["links_found"] = len(links)
+            for key, link in links.items():
+                found.setdefault(key, link)
     return {"roots": results, "found": found}
 
 
@@ -381,7 +430,7 @@ def probe_params(client, url, rows, limit) -> dict:
     base = page(client, url, limit)
     base_ids, base_total = ids(base), total(base)
     out = {"baseline": {**summarize(base), "ids": base_ids}}
-    attrs = {k for r in rows for k in (r.get("attributes") or {})}
+    attrs = {k for r in rows for k in (r.get("attributes") if isinstance(r.get("attributes"), dict) else r)}
     date_fields = sorted(a for a in attrs if DATE_FIELD.search(a))
     date_fields = sorted(date_fields, key=lambda f: (f != "dt_update", f != "dt_create", f))[:5]
     status_field = next((f for f in ("status_label", "status", "state") if f in attrs), None)
@@ -437,7 +486,7 @@ def probe_params(client, url, rows, limit) -> dict:
         includes[rel] = {**summarize(resp), "included": dict(Counter(i.get("type") for i in body.get("included") or []))}
     out["include"] = includes
 
-    if rows and rows[0].get("type") and rows[0].get("attributes"):
+    if rows and rows[0].get("type") and isinstance(rows[0].get("attributes"), dict):
         first_attr = sorted(rows[0]["attributes"])[0]
         resp = page(client, url, limit, extra=[(f"fields[{rows[0]['type']}]", first_attr)])
         kept = {k for r in records(resp) for k in (r.get("attributes") or {})}
@@ -471,12 +520,14 @@ def write_markdown(report: dict, path: Path):
              f"Запросов: {report['requests']}, маскирование: {'нет' if report['raw'] else 'да'}", ""]
     lines += ["## Корни API и схема", "", "| URL | статус | ключи |", "|---|---|---|"]
     for url, r in report["discovery"]["roots"].items():
-        lines.append(f"| {url} | {r.get('status')} | {', '.join(r.get('keys', [])[:15])} |")
+        extra = f" → ссылок {r['links_found']}, ответ: {r['saved']}" if r.get("saved") else ""
+        lines.append(f"| {url} | {r.get('status')} | {', '.join(r.get('keys', [])[:15])}{extra} |")
     for url, r in report["schemas"].items():
         if r.get("status") == 200:
             lines.append(f"| {url} | 200 | схема: {r.get('saved', r.get('content_type'))} |")
     if report["discovery"]["found"]:
-        lines += ["", "Найдено в корнях: " + ", ".join(sorted(report["discovery"]["found"]))]
+        lines += ["", f"Найдено в корнях ({len(report['discovery']['found'])}): "
+                  + ", ".join(sorted(report["discovery"]["found"]))]
 
     lines += ["", "## Эндпоинты", "", "| имя | статус | мс | записей всего | полей | связи |", "|---|---|---|---|---|---|"]
     for name, e in report["endpoints"].items():
@@ -562,16 +613,18 @@ def main() -> int:
             report["discovery"], report["schemas"] = {"roots": {}, "found": {}}, {}
         else:
             print("Корни API и адреса схемы...", flush=True)
-            report["discovery"] = discover_roots(client)
+            report["discovery"] = discover_roots(client, out_dir)
             report["schemas"] = probe_schemas(client, out_dir)
             known = {u.rstrip("/") for u in endpoints.values()}
             for name, url in list(report["discovery"]["found"].items())[:MAX_DISCOVERED]:
                 if url.rstrip("/") not in known:
                     endpoints.setdefault(name, url)
 
+        discovered = set(report["discovery"]["found"]) - set(ENDPOINTS)
         for name, url in endpoints.items():
             print(f"[{client.count} запр.] {name}: {url}", flush=True)
-            entry = probe_structure(client, name, url, args.sample, args.raw, out_dir)
+            sample = min(args.sample, 5) if name in discovered and name not in deep else args.sample
+            entry = probe_structure(client, name, url, sample, args.raw, out_dir)
             if name in deep and entry.get("schema"):
                 print(f"    параметры {name}...", flush=True)
                 rows = records(page(client, url, args.sample))
