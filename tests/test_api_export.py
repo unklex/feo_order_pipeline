@@ -148,3 +148,17 @@ def test_unpaged_list_is_one_page(tmp_path):
     out = ax.export(ax.Fetcher(s, delay=0), "dict", [f"{H}/webapi/v1/dict/region/"], tmp_path)
     assert len(json.loads((out / "records.json").read_text(encoding="utf-8"))) == 2
     assert len(s.calls) == 1
+
+
+def test_empty_endpoint_gives_readable_files(tmp_path):
+    import pandas as pd
+
+    class Empty(Session):
+        def get(self, url, params=None, timeout=None, allow_redirects=True):
+            return Resp(200, {"data": [], "meta": {"pagination": {"count": 0}}})
+
+    out = ax.export(ax.Fetcher(Empty(), delay=0), "driver", [f"{H}/filterapi/v1/driver/"], tmp_path)
+    assert json.loads((out / "records.json").read_text(encoding="utf-8")) == []
+    df = pd.read_csv(out / "records.csv", dtype=str, encoding="utf-8-sig", sep=ax.CSV_DELIMITER)
+    assert df.empty and list(df.columns) == ["id"]
+    assert json.loads((out / "info.json").read_text(encoding="utf-8"))["records"] == 0

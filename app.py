@@ -863,7 +863,13 @@ def export_tab():
                            use_container_width=True)
     d2.download_button("⬇ CSV (Excel)", csv_path.read_bytes(), file_name=f"{chosen.name}.csv",
                        use_container_width=True)
-    df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig", sep=api_export.CSV_DELIMITER)
+    try:
+        df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig", sep=api_export.CSV_DELIMITER)
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
+        df = pd.DataFrame()  # выгрузка без записей (старые файлы были совсем пустыми) или битый файл
+    if df.empty:
+        st.info(f"В этой выгрузке нет записей — эндпоинт ответил пустым списком. Папка `{chosen}`")
+        return
     st.caption(f"{len(df)} записей, {len(df.columns)} колонок · папка `{chosen}`")
     st.dataframe(df.head(500), hide_index=True, use_container_width=True, height=420)
 

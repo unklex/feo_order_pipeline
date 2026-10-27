@@ -214,7 +214,7 @@ def export(fetcher: Fetcher, name: str, candidates: list, out_root: Path, max_re
             body = r.json()
         raw.write("\n]\n")
 
-    columns = list(dict.fromkeys(k for row in rows for k in row))
+    columns = list(dict.fromkeys(k for row in rows for k in row)) or ["id"]  # пустой ответ — файл с заголовком
     with open(out / "records.csv", "w", encoding="utf-8-sig", newline="") as f:
         # «;» — разделитель русского Excel; каждое поле в кавычках, чтобы Excel не делил значение
         # по «;» или «,» внутри него (иначе кусок после разделителя стал бы отдельной ячейкой-формулой)
