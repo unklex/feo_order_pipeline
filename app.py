@@ -27,6 +27,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 
+import api_export
 import api_probe
 import env_config  # noqa: F401  (подгружает .env)
 import pipeline
@@ -449,6 +450,8 @@ def busy_reason() -> str:
         return "Идёт исследование API"
     if bg_state("telemetry").get("running"):
         return "Идёт выгрузка телеметрии"
+    if bg_state("export").get("running"):
+        return "Идёт выгрузка списка"
     return ""
 
 
@@ -713,9 +716,90 @@ def telemetry_tab():
 
 
 # ---------------------------------------------------------------------------
+# Вкладка «Выгрузки» (api_export.py): водители, ТС, транспортные задачи…
+# ---------------------------------------------------------------------------
+@st.fragment(run_every="2s")
+def export_panel():
+    state = bg_state("export")
+    if not state:
+        return
+    bg_finished_rerun("export", state["running"])
+    log = tail(state.get("log"), 200)
+    head = f"{state.get('title')} · {state.get('started', '').replace('T', ' ')} · {duration(state.get('started'))}"
+    if state["running"]:
+        st.info(f"{head} · идёт")
+    elif "login_fgis" in log or "Нет доступа" in log:
+        st.warning("Вход в ФГИС недействителен — нажмите «Войти в ФГИС» на вкладке «Запуск» и повторите.")
+    elif "Готово:" in log:
+        st.success(f"{head} · готово")
+    else:
+        st.error(f"{head} · не получилось — см. журнал")
+    st.code("\n".join(log.splitlines()[-12:]) or "(журнал пуст)", language=None)
+
+
+def export_tab():
+    st.caption("Только чтение: список целиком из API ФГИС (данные своей организации — ЭКОПРОМ) в CSV для Excel "
+               "и JSONL. Файлы с личными данными (ФИО, телефоны, документы) хранятся в папке exports/ "
+               "на этом компьютере и в git не попадают.")
+    state = bg_state("export")
+    running = state.get("running", False)
+    busy = busy_reason() if not running else ""
+    names = list(api_export.DATASETS)
+    with st.container(border=True):
+        c1, c2 = st.columns([1, 2])
+        dataset = c1.selectbox("Что выгрузить", names, format_func=lambda n: api_export.DATASETS[n][0])
+        url = c2.text_input("Или свой адрес эндпоинта", placeholder="https://gisopvk.ru/webapi/v1/driver/",
+                            help="Если адрес из списка не подошёл — возьмите настоящий из отчёта «Исследовать API».")
+        b1, b2 = st.columns([1, 3])
+        error = ""
+        if url.strip() and not api_probe.is_portal_url(url.strip()):
+            error = "Адрес должен быть на https://gisopvk.ru/"
+        if b1.button("▶ Выгрузить", type="primary", disabled=running or bool(busy) or bool(error),
+                     use_container_width=True):
+            args = ["api_export.py"] + (["--url", url.strip(), "--name", dataset] if url.strip() else [dataset])
+            bg_start("export", args, title=api_export.DATASETS[dataset][0])
+            st.rerun()
+        if error:
+            b2.error(error)
+        elif busy:
+            b2.caption(f"{busy} — выгрузку можно запустить после него.")
+        else:
+            b2.caption("Адреса, которые пробуются: "
+                       + ", ".join(u.replace(api_probe.HOST, "") for u in api_export.DATASETS[dataset][1]))
+
+    export_panel()
+
+    folders = sorted((p for p in api_export.EXPORT_DIR.glob("*_*") if (p / "records.csv").exists()),
+                     key=lambda p: p.stat().st_mtime, reverse=True)
+    if not folders:
+        return
+    st.divider()
+
+    def label(folder: Path) -> str:
+        try:
+            info = json.loads((folder / "info.json").read_text(encoding="utf-8"))
+            title = api_export.DATASETS.get(info["name"], (info["name"],))[0]
+            return f"{title} · {info['exported_at'].replace('T', ' ')} · {info['records']} зап."
+        except (FileNotFoundError, ValueError, KeyError):
+            return folder.name
+
+    chosen = st.selectbox("Выгрузка", folders, format_func=label)
+    csv_path, raw_path = chosen / "records.csv", chosen / "records.jsonl.gz"
+    d1, d2, _ = st.columns(3)
+    d1.download_button("⬇ CSV (Excel)", csv_path.read_bytes(), file_name=f"{chosen.name}.csv",
+                       use_container_width=True)
+    if raw_path.exists():
+        d2.download_button("⬇ JSONL (всё как в API)", raw_path.read_bytes(), file_name=f"{chosen.name}.jsonl.gz",
+                           use_container_width=True)
+    df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+    st.caption(f"{len(df)} записей, {len(df.columns)} колонок · папка `{chosen}`")
+    st.dataframe(df.head(500), hide_index=True, use_container_width=True, height=420)
+
+
+# ---------------------------------------------------------------------------
 st.title("ФЭО: заказы ФГИС → Битрикс24")
-tab_run, tab_data, tab_audit, tab_api, tab_tel = st.tabs(
-    ["Запуск", "Данные", "Журнал Битрикс", "API ФГИС", "Телеметрия"])
+tab_run, tab_data, tab_audit, tab_api, tab_tel, tab_exp = st.tabs(
+    ["Запуск", "Данные", "Журнал Битрикс", "API ФГИС", "Телеметрия", "Выгрузки"])
 with tab_run:
     run_tab()
 with tab_data:
@@ -726,3 +810,5 @@ with tab_api:
     api_tab()
 with tab_tel:
     telemetry_tab()
+with tab_exp:
+    export_tab()

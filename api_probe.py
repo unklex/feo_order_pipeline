@@ -65,6 +65,7 @@ ENDPOINTS = {
     "contract_recycling": f"{HOST}/webapi/v1/contract_recycling/",
     "contract_transportation": f"{HOST}/webapi/v1/contract_transportation/",
     "driver_task": f"{HOST}/webapi/v1/driver_task/",
+    "driver": f"{HOST}/webapi/v1/driver/",
 }
 DEFAULT_DEEP = ["order_transportation", "stencil_bid"]
 

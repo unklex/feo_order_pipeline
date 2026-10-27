@@ -24,6 +24,8 @@ opvk-export*.zip
 chk_*/
 # телеметрия (telemetry_download.py): точки ТС, десятки ГБ
 telemetry/
+# выгрузки списков (api_export.py): водители и т.п. — личные данные
+exports/
 export/
 progress/
 reports/
