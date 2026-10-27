@@ -78,3 +78,26 @@ def test_fetcher_refuses_other_hosts():
         pass
     else:
         raise AssertionError("ожидался отказ")
+
+
+def test_excel_formula_cells_are_neutralised(tmp_path):
+    assert ax.excel_safe('=HYPERLINK("http://evil","x")') == '\'=HYPERLINK("http://evil","x")'
+    assert ax.excel_safe("+cmd|' /C calc'!A0") == "'+cmd|' /C calc'!A0"
+    assert ax.excel_safe("@SUM(1)") == "'@SUM(1)"
+    assert ax.excel_safe("\t=1") == "'\t=1"
+    for keep in ("+79001234567", "+7 (900) 123-45-67", "-12.5", "Иванов", "", None, 5):
+        assert ax.excel_safe(keep) == keep
+
+    class Evil(Session):
+        def get(self, url, params=None, timeout=None, allow_redirects=True):
+            if url.endswith("/driver/"):
+                return Resp(200, {"data": [{"id": "1", "attributes": {"fio": "=1+1", "=bad": "x",
+                                                                       "phone": "+79001234567"}}],
+                                  "meta": {"pagination": {"count": 1}}})
+            return Resp(404)
+
+    out = ax.export(ax.Fetcher(Evil(), delay=0), "drivers", ax.DATASETS["drivers"][1], tmp_path)
+    header, row = list(csv.reader(open(out / "records.csv", encoding="utf-8-sig")))
+    assert "'=bad" in header
+    values = dict(zip(header, row))
+    assert values["fio"] == "'=1+1" and values["phone"] == "+79001234567"

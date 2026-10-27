@@ -23,6 +23,7 @@ import argparse
 import csv
 import gzip
 import json
+import re
 import sys
 import time
 from datetime import datetime
@@ -70,6 +71,21 @@ def flatten(record: dict) -> dict:
         elif isinstance(data, dict):
             row[f"rel.{rel}"] = data.get("id")
     return row
+
+
+FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+PLAIN_NUMBER = re.compile(r"^[+-]?[\d\s().,-]+$")  # телефоны, суммы: формулой не станут
+
+
+def excel_safe(value):
+    """Ячейка, которую Excel не выполнит как формулу: значения из ФГИС заполняют и сторонние люди.
+
+    Строку, начинающуюся с = + - @ (или табуляции), предваряет апостроф — Excel покажет её как текст.
+    Телефоны и числа вида +79001234567 / -12.5 не трогаем.
+    """
+    if isinstance(value, str) and value.startswith(FORMULA_START) and not PLAIN_NUMBER.match(value):
+        return "'" + value
+    return value
 
 
 class Fetcher:
@@ -150,9 +166,10 @@ def export(fetcher: Fetcher, name: str, candidates: list, out_root: Path) -> Pat
 
     columns = list(dict.fromkeys(k for row in rows for k in row))
     with open(out / "records.csv", "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(rows)
+        w = csv.writer(f)
+        w.writerow([excel_safe(c) for c in columns])
+        for row in rows:
+            w.writerow([excel_safe(row.get(c)) for c in columns])
     (out / "info.json").write_text(json.dumps({
         "name": name, "url": url, "sorted_by_id": bool(extra), "records": len(rows), "total_reported": count,
         "exported_at": datetime.now().isoformat(timespec="seconds")}, ensure_ascii=False, indent=1),
