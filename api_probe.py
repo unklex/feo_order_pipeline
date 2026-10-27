@@ -41,6 +41,7 @@ from gisopvkwebapiparser import GisopvkWebApiParser
 from pipeline_common import EXIT_AUTH_REQUIRED, ROOT
 
 HOST = "https://gisopvk.ru"
+PORTAL_HOST = "gisopvk.ru"
 ORDERS_URL = f"{HOST}/webapi/v1/order_transportation/"
 
 # Известные эндпоинты (из скриптов проекта и test_api.py)
@@ -88,14 +89,37 @@ API_PATH = re.compile(r"^(?:https?://[^/]+)?/(?:webapi|stencilapi)/v\d+/[\w./-]+
 class Client:
     """Сессия ФГИС (cookies и заголовки как у выгрузки) с паузой и учётом запросов."""
 
-    def __init__(self, delay: float, timeout: float, max_requests: int):
+    def __init__(self, delay: float, timeout: float, max_requests: int, raw: bool = False):
         self.parser = GisopvkWebApiParser(base_url=ORDERS_URL)
         self.session = self.parser.session
         self.delay, self.timeout, self.max_requests = delay, timeout, max_requests
+        self.raw = raw
         self.count = 0
 
     def login_ok(self) -> bool:
         return self.parser._load_cookies_from_file() and self.parser.test_auth()
+
+    def _send(self, method: str, url: str, stream: bool = False):
+        """Запрос только к порталу; редиректы — вручную и тоже только на портал.
+
+        Сессия хранит cookies без привязки к домену, и requests отправил бы их на любой адрес:
+        ссылки же берутся из ответов API (в т.ч. из полей, которые заполняют пользователи).
+        """
+        for _ in range(5):
+            if not is_portal_url(url):
+                raise PermissionError("адрес не на gisopvk.ru — запрос не отправлен")
+            r = self.session.request(method, url, timeout=self.timeout, stream=stream, allow_redirects=False)
+            if r.is_redirect and r.headers.get("Location"):
+                location = r.headers["Location"]
+                url = location if location.startswith("http") else HOST + "/" + location.lstrip("/")
+                r.close()
+                continue
+            return r
+        raise RuntimeError("слишком много перенаправлений")
+
+    def _error(self, e: Exception) -> str:
+        # текст исключения может содержать адрес (с путём к файлу) — без --raw только тип
+        return f"{type(e).__name__}: {e}"[:300] if self.raw else type(e).__name__
 
     def request(self, url: str, params=None, method: str = "GET") -> dict:
         if self.count >= self.max_requests:
@@ -107,10 +131,10 @@ class Client:
         time.sleep(self.delay)
         started = time.time()
         try:
-            r = self.session.request(method, full, timeout=self.timeout)
+            r = self._send(method, full)
         except Exception as e:
             return {"url": full, "status": None, "ms": int((time.time() - started) * 1000),
-                    "error": f"{type(e).__name__}: {e}"[:300]}
+                    "error": self._error(e)}
         result = {"url": full, "status": r.status_code, "ms": int((time.time() - started) * 1000),
                   "content_type": r.headers.get("Content-Type", ""), "bytes": len(r.content),
                   "allow": r.headers.get("Allow")}
@@ -123,25 +147,30 @@ class Client:
         return result
 
     def peek(self, url: str, max_bytes: int = 8192) -> dict:
-        """GET файла: только заголовки и первые max_bytes, тело дальше не читается и не сохраняется."""
+        """GET файла: только заголовки и первые max_bytes, тело дальше не читается и не сохраняется.
+
+        Без --raw в результат не попадают адрес (путь к файлу может содержать имя) и начало тела
+        (страница ошибки или JSON могут содержать данные) — только статус, тип и размер.
+        """
+        shown_url = url if self.raw else None
         if self.count >= self.max_requests:
-            return {"url": url, "status": None, "error": "лимит запросов (--max-requests) исчерпан"}
+            return {"url": shown_url, "status": None, "error": "лимит запросов (--max-requests) исчерпан"}
         self.count += 1
         time.sleep(self.delay)
         started = time.time()
         try:
-            with self.session.get(url, timeout=self.timeout, stream=True) as r:
+            with self._send("GET", url, stream=True) as r:
                 head = r.raw.read(max_bytes, decode_content=True) or b""
-                result = {"url": url, "status": r.status_code, "ms": int((time.time() - started) * 1000),
+                result = {"url": shown_url, "status": r.status_code, "ms": int((time.time() - started) * 1000),
                           "content_type": r.headers.get("Content-Type", ""),
                           "size": r.headers.get("Content-Length"), "kind": sniff(head),
                           "filename_ext": disposition_ext(r.headers.get("Content-Disposition", ""))}
-                if r.status_code >= 400 or result["kind"] in ("json", "html"):
+                if self.raw and (r.status_code >= 400 or result["kind"] in ("json", "html")):
                     result["text"] = head[:300].decode("utf-8", errors="replace")
                 return result
         except Exception as e:
-            return {"url": url, "status": None, "ms": int((time.time() - started) * 1000),
-                    "error": f"{type(e).__name__}: {e}"[:300]}
+            return {"url": shown_url, "status": None, "ms": int((time.time() - started) * 1000),
+                    "error": self._error(e)}
 
     def close(self):
         self.parser.close()
@@ -175,6 +204,17 @@ def disposition_ext(header: str) -> str:
         return ""
     name = match.group(1)
     return name.rsplit(".", 1)[-1].lower() if "." in name else "(без расширения)"
+
+
+def is_portal_url(url: str) -> bool:
+    """https://gisopvk.ru/… ровно: без логина/пароля в адресе, без чужого порта и поддомена-обманки."""
+    try:
+        u = urlparse(url)
+        port = u.port
+    except ValueError:
+        return False
+    return (u.scheme == "https" and u.hostname == PORTAL_HOST and u.username is None and u.password is None
+            and port in (None, 443))
 
 
 def page(client, url, limit, offset=0, extra=None):
@@ -330,6 +370,8 @@ def root_links(body, root_url: str) -> dict:
         if not isinstance(link, str) or not API_PATH.match(link.split("?")[0]):
             return
         link = link if link.startswith("http") else HOST + link
+        if not is_portal_url(link):
+            return  # ссылки на другие сайты не проверяем (сессия ушла бы туда же)
         link = link.split("?")[0]
         link = link if link.endswith("/") else link + "/"
         if link.rstrip("/") == root_url.rstrip("/"):
@@ -470,15 +512,18 @@ def file_link_kind(link: str):
         return None
     url = link.strip()
     if url.startswith("http"):
-        if not url.startswith(HOST):
-            return None
+        if not is_portal_url(url):
+            return None  # чужой хост, в т.ч. gisopvk.ru.example.com и https://gisopvk.ru@example.com
+    elif url.startswith("//"):
+        return None
     elif url.startswith("/"):
         url = HOST + url
     elif re.match(r"^(webapi|stencilapi|files|media)/", url):
         url = f"{HOST}/{url}"
     else:
         return None
-    path, _, query = url[len(HOST):].partition("?")
+    parsed = urlparse(url)
+    path, query = parsed.path, parsed.query
     if not FILE_WORDS.search(path) and not FILE_WORDS.search(query):
         return None
     if re.match(r"^/(webapi|stencilapi)/v\d+/[\w-]+/$", path) and not query:
@@ -780,7 +825,7 @@ def main() -> int:
         endpoints[name] = url if url.endswith("/") else url + "/"
     deep = set(args.deep or DEFAULT_DEEP)
 
-    client = Client(args.delay, args.timeout, args.max_requests)
+    client = Client(args.delay, args.timeout, args.max_requests, raw=args.raw)
     if not client.login_ok():
         client.close()
         print("Сохранённый вход в ФГИС недействителен — выполните: python login_fgis.py", flush=True)

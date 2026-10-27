@@ -165,3 +165,66 @@ def test_probe_files_documents_and_links():
     assert "/webapi/v1/document_file_dl/?id" in kinds
     doc = out["documents"]["document_invoice_order_transportation"]
     assert doc["status"] == 200 and doc["file_links"] == ["/webapi/v1/document_file_dl/?id"]
+
+
+def test_portal_url_rejects_lookalikes():
+    assert ap.is_portal_url("https://gisopvk.ru/webapi/v1/file/1/view/")
+    assert ap.is_portal_url("https://gisopvk.ru:443/x")
+    for bad in ("https://gisopvk.ru.evil.com/file/1/view/", "https://gisopvk.ru@evil.com/file/1/view/",
+                "https://user:pw@gisopvk.ru/x", "https://gisopvk.ru:8443/x", "http://gisopvk.ru/x",
+                "https://evil.com/?u=https://gisopvk.ru", "https://gisopvk.ru:bad/x"):
+        assert not ap.is_portal_url(bad), bad
+    for bad in ("https://gisopvk.ru.evil.com/webapi/v1/file/1/view/", "//evil.com/webapi/v1/file/1/view/"):
+        assert ap.file_link_kind(bad) is None, bad
+    assert ap.root_links({"data": {"x": "https://gisopvk.ru.evil.com/webapi/v1/x/"}}, ap.HOST + "/webapi/v1/") == {}
+
+
+class FakeResponse:
+    def __init__(self, status, headers=None, body=b""):
+        import io
+        self.status_code, self.headers = status, headers or {}
+        self.raw = io.BytesIO(body)
+        self.raw.read = (lambda f: lambda n, decode_content=True: f(n))(self.raw.read)
+        self.is_redirect = status in (301, 302, 303, 307, 308)
+        self.content = body
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        pass
+
+
+def make_client(responses, raw=False):
+    client = ap.Client(delay=0, timeout=5, max_requests=100, raw=raw)
+    sent = []
+
+    class Session:
+        def request(self, method, url, **kw):
+            assert kw.get("allow_redirects") is False
+            sent.append(url)
+            return responses[url]
+
+    client.session = Session()
+    return client, sent
+
+
+def test_redirect_off_portal_is_not_followed():
+    client, sent = make_client({
+        "https://gisopvk.ru/webapi/v1/file/1/view/": FakeResponse(302, {"Location": "https://evil.com/steal"}),
+    })
+    out = client.peek("https://gisopvk.ru/webapi/v1/file/1/view/")
+    assert out["status"] is None and out["error"] == "PermissionError"
+    assert sent == ["https://gisopvk.ru/webapi/v1/file/1/view/"]
+
+
+def test_peek_keeps_no_url_or_body_without_raw():
+    url = "https://gisopvk.ru/files/photo/Иванов_паспорт.jpg"
+    client, _ = make_client({url: FakeResponse(404, {"Content-Type": "text/html"}, "<html>Иванов</html>".encode())})
+    out = client.peek(url)
+    assert out["status"] == 404 and out["url"] is None and "text" not in out
+    client_raw, _ = make_client({url: FakeResponse(404, {"Content-Type": "text/html"}, b"<html>x</html>")}, raw=True)
+    assert client_raw.peek(url)["url"] == url
