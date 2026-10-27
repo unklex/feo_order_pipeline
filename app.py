@@ -408,19 +408,55 @@ def audit_tab():
 
 
 # ---------------------------------------------------------------------------
-# Вкладка «API ФГИС» (api_probe.py)
+# Фоновые запуски вне пайплайна (исследование API, телеметрия)
 # ---------------------------------------------------------------------------
 REPORTS_DIR = ROOT / "reports"
-PROBE_STATE = REPORTS_DIR / "api_probe_state.json"
 
 
-def probe_state() -> dict:
+def bg_state(kind: str) -> dict:
+    """Состояние фонового запуска kind ('api_probe', 'telemetry') + running по живости процесса."""
     try:
-        state = json.loads(PROBE_STATE.read_text(encoding="utf-8"))
+        state = json.loads((REPORTS_DIR / f"{kind}_state.json").read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError):
         return {}
     state["running"] = pid_alive(state.get("pid"))
     return state
+
+
+def bg_start(kind: str, args: list, **extra):
+    REPORTS_DIR.mkdir(exist_ok=True)
+    log = REPORTS_DIR / f"{kind}_run_{datetime.now():%Y%m%d_%H%M%S}.log"
+    pid = launch(args, log_path=log)
+    state = {"pid": pid, "started": datetime.now().isoformat(timespec="seconds"), "log": str(log),
+             "args": args[1:], **extra}
+    (REPORTS_DIR / f"{kind}_state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+
+def bg_finished_rerun(kind: str, running: bool):
+    """Запуск начался/закончился — перерисовать страницу целиком (кнопки вне фрагмента)."""
+    key = f"{kind}_seen"
+    previous = st.session_state.get(key)
+    st.session_state[key] = running
+    if previous is not None and previous != running:
+        st.rerun(scope="app")
+
+
+def busy_reason() -> str:
+    """Что уже нагружает ФГИС: тогда новый запуск не даём."""
+    if current_state().get("status") == "running":
+        return "Идёт сценарий пайплайна"
+    if bg_state("api_probe").get("running"):
+        return "Идёт исследование API"
+    if bg_state("telemetry").get("running"):
+        return "Идёт выгрузка телеметрии"
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Вкладка «API ФГИС» (api_probe.py)
+# ---------------------------------------------------------------------------
+def probe_state() -> dict:
+    return bg_state("api_probe")
 
 
 def probe_reports() -> list:
@@ -453,11 +489,7 @@ def start_probe(deep: list, extra: str, raw: bool, sample: int) -> str:
             args += ["--deep", name.strip()]
     if raw:
         args.append("--raw")
-    REPORTS_DIR.mkdir(exist_ok=True)
-    log = REPORTS_DIR / f"api_probe_run_{datetime.now():%Y%m%d_%H%M%S}.log"
-    pid = launch(args, log_path=log)
-    PROBE_STATE.write_text(json.dumps({"pid": pid, "started": datetime.now().isoformat(timespec="seconds"),
-                                       "log": str(log), "args": args[1:]}, ensure_ascii=False), encoding="utf-8")
+    bg_start("api_probe", args)
     return ""
 
 
@@ -467,11 +499,7 @@ def probe_panel():
     if not state:
         st.caption("Исследование ещё не запускалось.")
         return
-    seen = state["running"]
-    previous = st.session_state.get("probe_seen")
-    st.session_state["probe_seen"] = seen
-    if previous is not None and previous != seen:
-        st.rerun(scope="app")  # запуск закончился — включить кнопку и показать новый отчёт
+    bg_finished_rerun("api_probe", state["running"])
     log = tail(state.get("log"), 400)
     requests = re.findall(r"\[(\d+) запр\.\]", log)
     head = f"Запуск {state.get('started', '').replace('T', ' ')} · {duration(state.get('started'))}"
@@ -490,9 +518,9 @@ def api_tab():
     st.caption("Только чтение: GET/OPTIONS к gisopvk.ru с сохранённым входом, пауза между запросами. "
                "Проверяет поля эндпоинтов, связи и какие sort/фильтры/include сервер применяет. "
                "Обычно 5–15 минут.")
-    busy = current_state().get("status") == "running"
     state = probe_state()
     running = state.get("running", False)
+    busy = busy_reason() if not running else ""
 
     with st.container(border=True):
         names = list(api_probe.ENDPOINTS)
@@ -505,7 +533,7 @@ def api_tab():
         raw = c2.checkbox("Без маскирования (телефоны, ФИО, ИНН — как есть)")
         sample = c3.number_input("Записей в выборке", min_value=5, max_value=100, value=20, step=5)
         b1, b2, b3 = st.columns([1, 1, 2])
-        if b1.button("🔎 Исследовать API", type="primary", disabled=running or busy,
+        if b1.button("🔎 Исследовать API", type="primary", disabled=running or bool(busy),
                      use_container_width=True):
             error = start_probe(deep, extra, raw, int(sample))
             if error:
@@ -518,7 +546,7 @@ def api_tab():
             (b3.error(error) if error else st.toast("Остановлено"))
             st.rerun()
         if busy:
-            b3.caption("Идёт сценарий пайплайна — исследование можно запустить после него.")
+            b3.caption(f"{busy} — исследование можно запустить после него.")
 
     probe_panel()
 
@@ -545,8 +573,148 @@ def api_tab():
 
 
 # ---------------------------------------------------------------------------
+# Вкладка «Телеметрия» (telemetry_download.py)
+# ---------------------------------------------------------------------------
+RE_TEL_TOTAL = re.compile(r"заданий: (\d+) \(уже готово: (\d+)\)")
+RE_TEL_DONE = re.compile(r"готово (\d+)/(\d+) заданий, точек в этом запуске: (\d+)")
+
+
+def default_telemetry_dir() -> str:
+    last = bg_state("telemetry").get("out")
+    if last:
+        return last
+    if os.environ.get("TELEMETRY_DIR"):
+        return os.environ["TELEMETRY_DIR"]
+    return str(ROOT / "telemetry")
+
+
+def size_text(n: int) -> str:
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if n < 1024 or unit == "ГБ":
+            return f"{n:.0f} {unit}" if unit == "Б" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+@st.fragment(run_every="2s")
+def telemetry_panel():
+    state = bg_state("telemetry")
+    if not state:
+        st.caption("Выгрузка телеметрии ещё не запускалась.")
+        return
+    bg_finished_rerun("telemetry", state["running"])
+    log = tail(state.get("log"), 400)
+    head = (f"{'Проверка' if state.get('dry_run') else 'Выгрузка'} "
+            f"{state.get('started', '').replace('T', ' ')} · {duration(state.get('started'))} · "
+            f"папка `{state.get('out')}`")
+    done = RE_TEL_DONE.findall(log)
+    if state["running"]:
+        st.info(f"{head} · идёт")
+        if done:
+            n, total, pts = map(int, done[-1])
+            st.progress(min(n / max(total, 1), 1.0), text=f"{n} из {total} окон (сутки × машина) · "
+                                                           f"точек: {pts:,}".replace(",", " "))
+        else:
+            st.progress(0, text="список машин и подготовка…")
+    elif "login_fgis" in log or "Нужен вход" in log:
+        st.warning("Вход в ФГИС недействителен или истёк — нажмите «Войти в ФГИС» на вкладке «Запуск» "
+                   "и запустите снова: выгрузка продолжится с места остановки.")
+    elif "Итого:" in log or (state.get("dry_run") and RE_TEL_TOTAL.search(log)):
+        failed = re.findall(r"заданий с ошибкой (\d+)", log)
+        if failed and int(failed[-1]):
+            st.warning(f"{head} · готово, но {failed[-1]} окон не скачались — запустите снова, они повторятся")
+        else:
+            st.success(f"{head} · готово")
+    else:
+        st.error(f"{head} · остановлено или прервано — запустите снова, продолжит с места остановки")
+    st.code("\n".join(log.splitlines()[-12:]) or "(журнал пуст)", language=None)
+
+
+def telemetry_results(folder: Path):
+    if not folder.is_dir():
+        return
+    parts = sorted(folder.glob("telemetry_*.csv.gz"))
+    summary, vehicles = folder / "summary.csv", folder / "vehicles.csv"
+    if not (parts or summary.exists() or vehicles.exists()):
+        return
+    st.divider()
+    st.subheader("Скачано")
+    total = sum(p.stat().st_size for p in parts)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Файлов с точками", len(parts))
+    m2.metric("Объём (gzip)", size_text(total))
+    if summary.exists():
+        df = pd.read_csv(summary, dtype={"vehicle_id": str, "tracker_id": str})  # трекер «IMEI.порт» — не число
+        m3.metric("Машин с точками / точек", f"{len(df)} / {int(df['points'].sum()):,}".replace(",", " "))
+        st.dataframe(df.sort_values("points", ascending=False), hide_index=True, use_container_width=True,
+                     height=300)
+    d1, d2, _ = st.columns(3)
+    if summary.exists():
+        d1.download_button("⬇ summary.csv", summary.read_bytes(), file_name="summary.csv",
+                           use_container_width=True)
+    if vehicles.exists():
+        d2.download_button("⬇ vehicles.csv", vehicles.read_bytes(), file_name="vehicles.csv",
+                           use_container_width=True)
+    if parts:
+        st.caption(f"Точки — в папке `{folder}`: " + ", ".join(p.name for p in parts[-5:])
+                   + (f" и ещё {len(parts) - 5}" if len(parts) > 5 else "")
+                   + ". Колонки: vehicle_id, plate, tracker_id, date_time, lat, lon, speed, course, sat, "
+                     "telemetry_state. Открываются pandas (`pd.read_csv(файл)`), 7-Zip, DBeaver.")
+
+
+def telemetry_tab():
+    st.caption("Только чтение: история точек ТС из ФГИС (/webapi/v1/tracking/telemetry/) с сохранённым входом, "
+               "до 5 запросов в секунду. Окна по суткам, насыщенные дробятся до 10 минут, повторы точек "
+               "убираются. Остановить можно в любой момент — повторный запуск докачает только недостающее.")
+    state = bg_state("telemetry")
+    running = state.get("running", False)
+    busy = busy_reason() if not running else ""
+
+    with st.container(border=True):
+        c1, c2, c3 = st.columns([1, 1, 2])
+        day_from = c1.date_input("С", value=datetime(2025, 1, 1).date(), format="DD.MM.YYYY")
+        day_to = c2.date_input("По (включительно)", value=datetime.now().date(), format="DD.MM.YYYY")
+        out = c3.text_input("Папка результата", value=default_telemetry_dir(),
+                            help="На диске с запасом места: за весь период это десятки ГБ.")
+        c4, c5 = st.columns([1, 2])
+        all_vehicles = c4.checkbox("И машины без телеметрии", help="По умолчанию — только те, у кого она была.")
+        only = c5.text_input("Только эти vehicle_id (через запятую)", placeholder="10469, 10566",
+                             help="Для проверки на одной-двух машинах.")
+        b1, b2, b3, b4 = st.columns([1, 1, 1, 2])
+        base = ["telemetry_download.py", "--from", f"{day_from:%Y-%m-%d}", "--to", f"{day_to:%Y-%m-%d}",
+                "--out", out.strip()]
+        base += ["--all-vehicles"] if all_vehicles else []
+        base += ["--vehicles", only.replace(" ", "")] if only.strip() else []
+        error = ""
+        if day_from > day_to:
+            error = "«С» позже «По»"
+        elif not out.strip():
+            error = "Укажите папку"
+        if b1.button("Проверить", disabled=running or bool(busy) or bool(error), use_container_width=True,
+                     help="Только список машин и число запросов, без скачивания точек."):
+            bg_start("telemetry", base + ["--dry-run"], out=out.strip(), dry_run=True)
+            st.rerun()
+        if b2.button("▶ Скачать", type="primary", disabled=running or bool(busy) or bool(error),
+                     use_container_width=True):
+            bg_start("telemetry", base, out=out.strip(), dry_run=False)
+            st.toast("Выгрузка телеметрии запущена")
+            st.rerun()
+        if running and b3.button("■ Остановить", use_container_width=True):
+            err = kill_tree(int(state["pid"]))
+            (b4.error(err) if err else st.toast("Остановлено — продолжить можно кнопкой «Скачать»"))
+            st.rerun()
+        if error:
+            b4.error(error)
+        elif busy:
+            b4.caption(f"{busy} — выгрузку можно запустить после него.")
+
+    telemetry_panel()
+    telemetry_results(Path(state.get("out") or out.strip()))
+
+
+# ---------------------------------------------------------------------------
 st.title("ФЭО: заказы ФГИС → Битрикс24")
-tab_run, tab_data, tab_audit, tab_api = st.tabs(["Запуск", "Данные", "Журнал Битрикс", "API ФГИС"])
+tab_run, tab_data, tab_audit, tab_api, tab_tel = st.tabs(
+    ["Запуск", "Данные", "Журнал Битрикс", "API ФГИС", "Телеметрия"])
 with tab_run:
     run_tab()
 with tab_data:
@@ -555,3 +723,5 @@ with tab_audit:
     audit_tab()
 with tab_api:
     api_tab()
+with tab_tel:
+    telemetry_tab()

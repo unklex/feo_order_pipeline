@@ -68,6 +68,15 @@ uv run pipeline.py statuses --skip-download
 
 Структура API ФГИС (поля эндпоинтов, какие sort/фильтры/include работают, время ответа) — `uv run api_probe.py` или кнопка «Исследовать API» на вкладке **API ФГИС**, только чтение; отчёт в `reports/api_probe_<время>/report.md` (там же скачать md/json/zip).
 
+Телеметрия (история точек ТС) — вкладка **Телеметрия** в UI или из консоли, только чтение:
+
+```powershell
+uv run telemetry_download.py --from 2025-01-01 --out D:	elemetry_full --dry-run   # подсчёт
+uv run telemetry_download.py --from 2025-01-01 --out D:	elemetry_full             # выгрузка
+```
+
+Точки — `telemetry_<время>.csv.gz` в папке, плюс `summary.csv` и `vehicles.csv`. Повторный запуск докачивает только недостающее (в т.ч. после истёкшего входа или остановки). Заменяет `telemetry_export.py` + `opvk-export.exe`: тот же API и те же окна, exe не нужен.
+
 Тесты: `uv run pytest`.
 
 ## Файлы

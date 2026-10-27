@@ -22,6 +22,8 @@ parsed_bids/
 opvk-export*/
 opvk-export*.zip
 chk_*/
+# телеметрия (telemetry_download.py): точки ТС, десятки ГБ
+telemetry/
 export/
 progress/
 reports/
