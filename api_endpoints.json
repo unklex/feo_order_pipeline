@@ -1,0 +1,851 @@
+{
+ "source": "корни https://gisopvk.ru/webapi/v1/ и /stencilapi/v1/ (2026-10-27) + известные webapi-адреса",
+ "endpoints": [
+  {
+   "name": "aggregation_state",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/aggregation_state/"
+  },
+  {
+   "name": "analytic_report",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/analytic_report/"
+  },
+  {
+   "name": "analytic_report_cube",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/analytic_report_cube/"
+  },
+  {
+   "name": "analytic_report_fo",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/analytic_report_fo/"
+  },
+  {
+   "name": "analytic_report_task",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/analytic_report_task/"
+  },
+  {
+   "name": "bid",
+   "aliases": [
+    "bid_ws",
+    "charge_complex_service",
+    "charge_recycling",
+    "order_waste_source"
+   ],
+   "url": "https://gisopvk.ru/stencilapi/v1/order_waste_source/"
+  },
+  {
+   "name": "bid_webapi",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/bid/"
+  },
+  {
+   "name": "claim_facility",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/claim_facility/"
+  },
+  {
+   "name": "claim_payment",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/claim_payment/"
+  },
+  {
+   "name": "claim_transporter",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/claim_transporter/"
+  },
+  {
+   "name": "claim_waste_source",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/claim_waste_source/"
+  },
+  {
+   "name": "contact_detail",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contact_detail/"
+  },
+  {
+   "name": "contactdetail_bid",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contactdetail_bid/"
+  },
+  {
+   "name": "contactdetail_claim_facility",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contactdetail_claim_facility/"
+  },
+  {
+   "name": "contactdetail_claim_transporter",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contactdetail_claim_transporter/"
+  },
+  {
+   "name": "contactdetail_claim_waste_source",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contactdetail_claim_waste_source/"
+  },
+  {
+   "name": "contactdetail_contract_eot",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contactdetail_contract_eot/"
+  },
+  {
+   "name": "contactdetail_contract_recycling",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contactdetail_contract_recycling/"
+  },
+  {
+   "name": "contactdetail_contract_transportation",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contactdetail_contract_transportation/"
+  },
+  {
+   "name": "contactdetail_contract_waste_generator",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contactdetail_contract_waste_generator/"
+  },
+  {
+   "name": "contactdetail_facility",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contactdetail_facility/"
+  },
+  {
+   "name": "contactdetail_organization_info",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contactdetail_organization_info/"
+  },
+  {
+   "name": "contactdetail_pvn",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contactdetail_pvn/"
+  },
+  {
+   "name": "contactdetail_recycle_report",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contactdetail_recycle_report/"
+  },
+  {
+   "name": "contactdetail_subcontract_waste_generator",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contactdetail_subcontract_waste_generator/"
+  },
+  {
+   "name": "contactdetail_support_ticket",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contactdetail_support_ticket/"
+  },
+  {
+   "name": "contactdetail_vehicle",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contactdetail_vehicle/"
+  },
+  {
+   "name": "contactdetail_wasteplace",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contactdetail_wasteplace/"
+  },
+  {
+   "name": "contract_complex_service",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/contract_complex_service/"
+  },
+  {
+   "name": "contract_complex_service_bid",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contract_complex_service_bid/"
+  },
+  {
+   "name": "contract_complex_service_facility",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contract_complex_service_facility/"
+  },
+  {
+   "name": "contract_complex_service_facility_fkko",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contract_complex_service_facility_fkko/"
+  },
+  {
+   "name": "contract_complex_service_facility_special_price",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contract_complex_service_facility_special_price/"
+  },
+  {
+   "name": "contract_eot",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contract_eot/"
+  },
+  {
+   "name": "contract_eot_fkko",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contract_eot_fkko/"
+  },
+  {
+   "name": "contract_eot_fkko_region",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contract_eot_fkko_region/"
+  },
+  {
+   "name": "contract_recycling",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/contract_recycling/"
+  },
+  {
+   "name": "contract_recycling_bid",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contract_recycling_bid/"
+  },
+  {
+   "name": "contract_recycling_facility",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contract_recycling_facility/"
+  },
+  {
+   "name": "contract_recycling_facility_fkko",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contract_recycling_facility_fkko/"
+  },
+  {
+   "name": "contract_recycling_facility_special_price",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contract_recycling_facility_special_price/"
+  },
+  {
+   "name": "contract_transportation",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/contract_transportation/"
+  },
+  {
+   "name": "contract_transportation_bid",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contract_transportation_bid/"
+  },
+  {
+   "name": "contract_transportation_fkko",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contract_transportation_fkko/"
+  },
+  {
+   "name": "contract_transportation_special_price",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contract_transportation_special_price/"
+  },
+  {
+   "name": "contract_waste_generator",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/contract_waste_generator/"
+  },
+  {
+   "name": "contract_waste_generator_wasteplace",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contract_waste_generator_wasteplace/"
+  },
+  {
+   "name": "contract_waste_generator_wasteplace_fkko",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/contract_waste_generator_wasteplace_fkko/"
+  },
+  {
+   "name": "dict/dangerous_class",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/dict/dangerous_class/"
+  },
+  {
+   "name": "dict/federal_district",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/dict/federal_district/"
+  },
+  {
+   "name": "dict/fkko",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/dict/fkko/"
+  },
+  {
+   "name": "dict/fkko_group",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/dict/fkko_group/"
+  },
+  {
+   "name": "dict/municipality",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/dict/municipality/"
+  },
+  {
+   "name": "dict/okfs",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/dict/okfs/"
+  },
+  {
+   "name": "dict/okpd2",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/dict/okpd2/"
+  },
+  {
+   "name": "dict/region",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/dict/region/"
+  },
+  {
+   "name": "dict/transport_alternative",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/dict/transport_alternative/"
+  },
+  {
+   "name": "dict/waste_container_type",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/dict/waste_container_type/"
+  },
+  {
+   "name": "dict/wastetank_method",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/dict/wastetank_method/"
+  },
+  {
+   "name": "dict/wastetank_type",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/dict/wastetank_type/"
+  },
+  {
+   "name": "document_act_mass_correction_order_waste_source",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/document_act_mass_correction_order_waste_source/"
+  },
+  {
+   "name": "document_act_provide_order_recycling",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/document_act_provide_order_recycling/"
+  },
+  {
+   "name": "document_act_provide_order_transportation",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/document_act_provide_order_transportation/"
+  },
+  {
+   "name": "document_act_provide_order_waste_source",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/document_act_provide_order_waste_source/"
+  },
+  {
+   "name": "document_act_returning_order_waste_source",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/document_act_returning_order_waste_source/"
+  },
+  {
+   "name": "document_act_transfer_order_recycling",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/document_act_transfer_order_recycling/"
+  },
+  {
+   "name": "document_act_transfer_order_waste_source",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/document_act_transfer_order_waste_source/"
+  },
+  {
+   "name": "document_invoice_order_recycling",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/document_invoice_order_recycling/"
+  },
+  {
+   "name": "document_invoice_order_transportation",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/document_invoice_order_transportation/"
+  },
+  {
+   "name": "document_invoice_order_waste_source",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/document_invoice_order_waste_source/"
+  },
+  {
+   "name": "document_upd_order_recycling",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/document_upd_order_recycling/"
+  },
+  {
+   "name": "document_upd_order_transportation",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/document_upd_order_transportation/"
+  },
+  {
+   "name": "document_upd_order_waste_source",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/document_upd_order_waste_source/"
+  },
+  {
+   "name": "driver",
+   "aliases": [],
+   "url": "https://gisopvk.ru/filterapi/v1/driver/"
+  },
+  {
+   "name": "driver_task",
+   "aliases": [
+    "telemetry_monitoring"
+   ],
+   "url": "https://gisopvk.ru/stencilapi/v1/driver_task/"
+  },
+  {
+   "name": "driver_task_branch",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/driver_task_branch/"
+  },
+  {
+   "name": "email",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/email/"
+  },
+  {
+   "name": "eosdo_integration_task",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/eosdo_integration_task/"
+  },
+  {
+   "name": "erp_payment",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/erp_payment/"
+  },
+  {
+   "name": "erp_task",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/erp_task/"
+  },
+  {
+   "name": "facility",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/facility/"
+  },
+  {
+   "name": "facility_operation",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/facility_operation/"
+  },
+  {
+   "name": "facility_operation_waste",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/facility_operation_waste/"
+  },
+  {
+   "name": "facility_product",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/facility_product/"
+  },
+  {
+   "name": "facility_waste",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/facility_waste/"
+  },
+  {
+   "name": "file",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/file/"
+  },
+  {
+   "name": "file_public",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/file_public/"
+  },
+  {
+   "name": "groro_registry",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/groro_registry/"
+  },
+  {
+   "name": "group_analytic_report",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/group_analytic_report/"
+  },
+  {
+   "name": "integration_asu_regoperator",
+   "aliases": [],
+   "url": "https://gisopvk.ru/externalapi/v1/integration_asu_regoperator/"
+  },
+  {
+   "name": "integration_asu_regoperator_mkd",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/integration_asu_regoperator_mkd/"
+  },
+  {
+   "name": "integration_gisp",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/integration_gisp/"
+  },
+  {
+   "name": "integration_tsoo",
+   "aliases": [],
+   "url": "https://gisopvk.ru/externalapi/v1/integration_tsoo/"
+  },
+  {
+   "name": "integration_waste_container_processing",
+   "aliases": [],
+   "url": "https://gisopvk.ru/externalapi/v1/integration_waste_container_processing/"
+  },
+  {
+   "name": "integration_waste_report",
+   "aliases": [],
+   "url": "https://gisopvk.ru/externalapi/v1/integration_waste_report/"
+  },
+  {
+   "name": "integration_weighing",
+   "aliases": [],
+   "url": "https://gisopvk.ru/externalapi/v1/integration_weighing/"
+  },
+  {
+   "name": "license",
+   "aliases": [
+    "license_new"
+   ],
+   "url": "https://gisopvk.ru/webapi/v1/license_new/"
+  },
+  {
+   "name": "license_address",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/license_address/"
+  },
+  {
+   "name": "license_waste",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/license_waste/"
+  },
+  {
+   "name": "main_tender_period",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/main_tender_period/"
+  },
+  {
+   "name": "mobile_phone",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/mobile_phone/"
+  },
+  {
+   "name": "mrpoa",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/mrpoa/"
+  },
+  {
+   "name": "mrpoa_power",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/mrpoa_power/"
+  },
+  {
+   "name": "notice_message",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/notice_message/"
+  },
+  {
+   "name": "nvos",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/nvos/"
+  },
+  {
+   "name": "object_distribution_task",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/object_distribution_task/"
+  },
+  {
+   "name": "off_system_payment",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/off_system_payment/"
+  },
+  {
+   "name": "off_system_payment_task",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/off_system_payment_task/"
+  },
+  {
+   "name": "offsystem_waste",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/offsystem_waste/"
+  },
+  {
+   "name": "order_recycling",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/order_recycling/"
+  },
+  {
+   "name": "order_recycling_invoice",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/order_recycling_invoice/"
+  },
+  {
+   "name": "order_transportation",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/order_transportation/"
+  },
+  {
+   "name": "order_transportation_invoice",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/order_transportation_invoice/"
+  },
+  {
+   "name": "order_transportation_webapi",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/order_transportation/"
+  },
+  {
+   "name": "order_waste_source_invoice",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/order_waste_source_invoice/"
+  },
+  {
+   "name": "organization_info",
+   "aliases": [
+    "contact_detail_org"
+   ],
+   "url": "https://gisopvk.ru/stencilapi/v1/organization_info/"
+  },
+  {
+   "name": "permission_ui",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/permission_ui/"
+  },
+  {
+   "name": "photo",
+   "aliases": [
+    "photo_charge"
+   ],
+   "url": "https://gisopvk.ru/webapi/v1/photo/"
+  },
+  {
+   "name": "popup",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/popup/"
+  },
+  {
+   "name": "popup_message",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/popup_message/"
+  },
+  {
+   "name": "production_plan",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/production_plan/"
+  },
+  {
+   "name": "production_plan_fkko",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/production_plan_fkko/"
+  },
+  {
+   "name": "production_plan_fkko_region",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/production_plan_fkko_region/"
+  },
+  {
+   "name": "pvn",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/pvn/"
+  },
+  {
+   "name": "pvn_service_area",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/pvn_service_area/"
+  },
+  {
+   "name": "pvn_waste",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/pvn_waste/"
+  },
+  {
+   "name": "recycle_product",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/recycle_product/"
+  },
+  {
+   "name": "recycle_report",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/recycle_report/"
+  },
+  {
+   "name": "recycle_waste",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/recycle_waste/"
+  },
+  {
+   "name": "refinancing_rate",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/refinancing_rate/"
+  },
+  {
+   "name": "respond_complex_service",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/respond_complex_service/"
+  },
+  {
+   "name": "respond_recycling",
+   "aliases": [
+    "charge_transportation"
+   ],
+   "url": "https://gisopvk.ru/stencilapi/v1/respond_recycling/"
+  },
+  {
+   "name": "respond_transportation",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/respond_transportation/"
+  },
+  {
+   "name": "role",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/role/"
+  },
+  {
+   "name": "role_ui",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/role_ui/"
+  },
+  {
+   "name": "route",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/route/"
+  },
+  {
+   "name": "route_order_transportation",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/route_order_transportation/"
+  },
+  {
+   "name": "route_point",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/route_point/"
+  },
+  {
+   "name": "sign_cart",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/sign_cart/"
+  },
+  {
+   "name": "stationary_phone",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/stationary_phone/"
+  },
+  {
+   "name": "stencil",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/stencil/"
+  },
+  {
+   "name": "stock_correction",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/stock_correction/"
+  },
+  {
+   "name": "subcontract_waste_generator",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/subcontract_waste_generator/"
+  },
+  {
+   "name": "support_ticket",
+   "aliases": [
+    "support_ticket_technical"
+   ],
+   "url": "https://gisopvk.ru/webapi/v1/support_ticket_technical/"
+  },
+  {
+   "name": "support_ticket_bid_payment_distribution",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/support_ticket_bid_payment_distribution/"
+  },
+  {
+   "name": "task",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/task/"
+  },
+  {
+   "name": "telemetry_load_task",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/telemetry_load_task/"
+  },
+  {
+   "name": "trip_doer",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/trip_doer/"
+  },
+  {
+   "name": "trip_facility_report",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/trip_facility_report/"
+  },
+  {
+   "name": "trip_point",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/trip_point/"
+  },
+  {
+   "name": "trip_report",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/trip_report/"
+  },
+  {
+   "name": "user",
+   "aliases": [
+    "user_contact"
+   ],
+   "url": "https://gisopvk.ru/filterapi/v1/verifier/"
+  },
+  {
+   "name": "user_profile",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/user_profile/"
+  },
+  {
+   "name": "vehicle",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/vehicle/"
+  },
+  {
+   "name": "vehicle_webapi",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/vehicle/"
+  },
+  {
+   "name": "waste_conflict",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/waste_conflict/"
+  },
+  {
+   "name": "waste_container",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/waste_container/"
+  },
+  {
+   "name": "waste_container_report",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/waste_container_report/"
+  },
+  {
+   "name": "waste_handover",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/waste_handover/"
+  },
+  {
+   "name": "wasteplace",
+   "aliases": [
+    "object_distribution_list"
+   ],
+   "url": "https://gisopvk.ru/stencilapi/v1/wasteplace/"
+  },
+  {
+   "name": "wasteplace_waste",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/wasteplace_waste/"
+  },
+  {
+   "name": "wasteplace_waste_component",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/wasteplace_waste_component/"
+  },
+  {
+   "name": "wastereport_operation",
+   "aliases": [],
+   "url": "https://gisopvk.ru/stencilapi/v1/wastereport_operation/"
+  },
+  {
+   "name": "wastereport_operation_correction",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/wastereport_operation_correction/"
+  },
+  {
+   "name": "wastetank",
+   "aliases": [],
+   "url": "https://gisopvk.ru/webapi/v1/wastetank/"
+  }
+ ]
+}

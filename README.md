@@ -77,7 +77,7 @@ uv run telemetry_download.py --from 2025-01-01 --out D:	elemetry_full           
 
 Точки — `telemetry_<время>.csv.gz` в папке, плюс `summary.csv` и `vehicles.csv`. Повторный запуск докачивает только недостающее (в т.ч. после истёкшего входа или остановки). Заменяет `telemetry_export.py` + `opvk-export.exe`: тот же API и те же окна, exe не нужен.
 
-Списки целиком (водители ЭКОПРОМ, ТС, транспортные задачи, договоры, лицензии) — вкладка **Выгрузки** или `uv run api_export.py drivers` (свой адрес: `--url https://gisopvk.ru/webapi/v1/…/`). Результат — `exports/<имя>_<время>/records.csv` (Excel) и `records.jsonl.gz`; в git не попадает (личные данные).
+Любые списки из API ФГИС — вкладка **Выгрузки**: все эндпоинты из корней API (водители — `/filterapi/v1/driver/`, транспортные задачи, рейсы, договоры, документы, справочники…) с поиском и отметками; выгружаются в `exports/<имя>_<время>/records.json` (как отдаёт API) и `records.csv` (Excel). Из консоли: `uv run api_export.py drivers` или `--target имя=https://gisopvk.ru/…/`, список эндпоинтов — `api_endpoints.json`, обновить из ФГИС — `--refresh-endpoints`. В git не попадает (личные данные).
 
 Тесты: `uv run pytest`.
 

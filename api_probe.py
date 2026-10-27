@@ -65,11 +65,12 @@ ENDPOINTS = {
     "contract_recycling": f"{HOST}/webapi/v1/contract_recycling/",
     "contract_transportation": f"{HOST}/webapi/v1/contract_transportation/",
     "driver_task": f"{HOST}/webapi/v1/driver_task/",
-    "driver": f"{HOST}/webapi/v1/driver/",
+    "driver": f"{HOST}/filterapi/v1/driver/",
+    "stencil_driver_task": f"{HOST}/stencilapi/v1/driver_task/",
 }
 DEFAULT_DEEP = ["order_transportation", "stencil_bid"]
 
-API_ROOTS = [f"{HOST}/webapi/v1/", f"{HOST}/stencilapi/v1/", f"{HOST}/webapi/", f"{HOST}/stencilapi/"]
+API_ROOTS = [f"{HOST}/webapi/v1/", f"{HOST}/stencilapi/v1/", f"{HOST}/filterapi/v1/", f"{HOST}/externalapi/v1/"]
 SCHEMA_URLS = [
     f"{HOST}/webapi/v1/schema/", f"{HOST}/webapi/schema/", f"{HOST}/stencilapi/v1/schema/",
     f"{HOST}/stencilapi/schema/", f"{HOST}/api/schema/", f"{HOST}/schema/", f"{HOST}/openapi.json",
@@ -81,7 +82,7 @@ SENSITIVE = re.compile(r"phone|tel|mail|fio|name|inn|snils|passport|contact|addr
                        r"login|user|person|comment|note|kpp|ogrn|bank|account|plate|imei", re.I)
 DATE_FIELD = re.compile(r"(^dt_|_dt$|_date$|^date_|_at$|^date$)", re.I)
 MAX_DISCOVERED = 200
-API_PATH = re.compile(r"^(?:https?://[^/]+)?/(?:webapi|stencilapi)/v\d+/[\w./-]+$")
+API_PATH = re.compile(r"^(?:https?://[^/]+)?/(?:webapi|stencilapi|filterapi|externalapi)/v\d+/[\w./-]+$")
 
 
 # ---------------------------------------------------------------------------

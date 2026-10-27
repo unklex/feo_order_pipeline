@@ -151,6 +151,18 @@ def current_state() -> dict:
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=60, show_spinner="Читаю БД…")
 def db_stats() -> dict:
+    """Счётчики заказов; при недоступной БД — {"error": текст}.
+
+    Ошибка тоже кэшируется на минуту: Streamlit пересчитывает все вкладки на каждый клик, и без этого
+    недоступный SSH-шлюз (таймаут ~20 с) подвешивал бы весь интерфейс на каждом действии.
+    """
+    try:
+        return _db_stats()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _db_stats() -> dict:
     tunnel = open_db_tunnel(os.environ.get("DB_HOST", "localhost"), int(os.environ.get("DB_PORT") or 3306))
     try:
         engine = create_engine(
@@ -323,8 +335,10 @@ def run_tab():
 def data_tab():
     if st.button("Обновить"):
         db_stats.clear()
-    try:
-        s = db_stats()
+    s = db_stats()
+    if s.get("error"):
+        st.error(f"Не удалось прочитать БД: {s['error']} — повтор через минуту или кнопкой «Обновить».")
+    else:
         cols = st.columns(6)
         cols[0].metric("Заказов в БД", s["total"])
         cols[1].metric("Активных", s["active"])
@@ -335,8 +349,6 @@ def data_tab():
                             "заполнит их или запросит заявки заново.")
         cols[5].metric("Заполнено", s["filled"])
         st.caption(f"Последнее изменение в БД: {s['last_update']}")
-    except Exception as e:
-        st.error(f"Не удалось прочитать БД: {e}")
 
     st.divider()
     left, right = st.columns(2)
@@ -720,7 +732,7 @@ def telemetry_tab():
 
 
 # ---------------------------------------------------------------------------
-# Вкладка «Выгрузки» (api_export.py): водители, ТС, транспортные задачи…
+# Вкладка «Выгрузки» (api_export.py): обозреватель всех эндпоинтов API
 # ---------------------------------------------------------------------------
 @st.fragment(run_every="2s")
 def export_panel():
@@ -728,53 +740,103 @@ def export_panel():
     if not state:
         return
     bg_finished_rerun("export", state["running"])
-    log = tail(state.get("log"), 200)
+    log = tail(state.get("log"), 300)
     head = f"{state.get('title')} · {state.get('started', '').replace('T', ' ')} · {duration(state.get('started'))}"
+    steps = re.findall(r"^\[(\d+)/(\d+)\] (.+)$", log, re.M)
     if state["running"]:
-        st.info(f"{head} · идёт")
+        st.info(f"{head} · идёт" + (f" · {steps[-1][0]} из {steps[-1][1]}: {steps[-1][2]}" if steps else ""))
     elif "login_fgis" in log or "Нет доступа" in log:
         st.warning("Вход в ФГИС недействителен — нажмите «Войти в ФГИС» на вкладке «Запуск» и повторите.")
-    elif "Готово:" in log:
+    elif "Не выгружено:" in log or "не выгружены" in log:
+        st.warning(f"{head} · готово, но часть эндпоинтов не выгрузилась — см. журнал")
+    elif "Итого:" in log or "Готово:" in log:
         st.success(f"{head} · готово")
     else:
         st.error(f"{head} · не получилось — см. журнал")
     st.code("\n".join(log.splitlines()[-12:]) or "(журнал пуст)", language=None)
 
 
+def export_folders() -> list:
+    return sorted((p for p in api_export.EXPORT_DIR.glob("*_*") if (p / "records.csv").exists()),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def zip_folders(folders: list) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for folder in folders:
+            for f in folder.rglob("*"):
+                if f.is_file():
+                    z.write(f, f.relative_to(folder.parent))
+    return buf.getvalue()
+
+
 def export_tab():
-    st.caption("Только чтение: список целиком из API ФГИС (данные своей организации — ЭКОПРОМ) в CSV для Excel "
-               "и JSONL. Файлы с личными данными (ФИО, телефоны, документы) хранятся в папке exports/ "
-               "на этом компьютере и в git не попадают.")
+    st.caption("Только чтение: любые списки из API ФГИС — водители, транспортные задачи, рейсы, договоры, документы, "
+               "справочники… Отметьте нужные и выгрузите в JSON (как отдаёт API) и CSV для Excel. Файлы с личными "
+               "данными хранятся в папке exports/ на этом компьютере и в git не попадают.")
     state = bg_state("export")
     running = state.get("running", False)
     busy = busy_reason() if not running else ""
-    names = list(api_export.DATASETS)
+
+    endpoints = api_export.load_endpoints()
+    picked = st.session_state.setdefault("export_picked", {"https://gisopvk.ru/filterapi/v1/driver/"})
     with st.container(border=True):
-        c1, c2 = st.columns([1, 2])
-        dataset = c1.selectbox("Что выгрузить", names, format_func=lambda n: api_export.DATASETS[n][0])
-        url = c2.text_input("Или свой адрес эндпоинта", placeholder="https://gisopvk.ru/webapi/v1/driver/",
-                            help="Если адрес из списка не подошёл — возьмите настоящий из отчёта «Исследовать API».")
-        b1, b2 = st.columns([1, 3])
-        error = ""
-        if url.strip() and not api_probe.is_portal_url(url.strip()):
-            error = "Адрес должен быть на https://gisopvk.ru/"
-        if b1.button("▶ Выгрузить", type="primary", disabled=running or bool(busy) or bool(error),
-                     use_container_width=True):
-            args = ["api_export.py"] + (["--url", url.strip(), "--name", dataset] if url.strip() else [dataset])
-            bg_start("export", args, title=api_export.DATASETS[dataset][0])
-            st.rerun()
-        if error:
-            b2.error(error)
-        elif busy:
-            b2.caption(f"{busy} — выгрузку можно запустить после него.")
+        f1, f2 = st.columns([2, 1])
+        query = f1.text_input("Поиск по имени или адресу", placeholder="driver, trip, invoice, dict/fkko…")
+        groups = sorted({e["group"] for e in endpoints})
+        chosen_groups = f2.multiselect("Группы", groups, placeholder="все группы")
+        shown = [e for e in endpoints
+                 if (not chosen_groups or e["group"] in chosen_groups)
+                 and (not query.strip() or query.strip().lower() in
+                      " ".join([e["name"], *e.get("aliases", []), e["url"]]).lower())]
+        table = pd.DataFrame([{"✓": e["url"] in picked, "Группа": e["group"], "Имя": e["name"],
+                               "Также": ", ".join(e.get("aliases", [])),
+                               "Адрес": e["url"].replace(api_probe.HOST, "")} for e in shown])
+        if table.empty:
+            st.caption("Ничего не найдено.")
         else:
-            b2.caption("Адреса, которые пробуются: "
-                       + ", ".join(u.replace(api_probe.HOST, "") for u in api_export.DATASETS[dataset][1]))
+            edited = st.data_editor(
+                table, hide_index=True, use_container_width=True, height=360, key=f"export_table_{query}_{chosen_groups}",
+                disabled=["Группа", "Имя", "Также", "Адрес"],
+                column_config={"✓": st.column_config.CheckboxColumn("✓", width="small")})
+            for e, ticked in zip(shown, edited["✓"]):
+                (picked.add if ticked else picked.discard)(e["url"])
+        s1, s2, s3 = st.columns([1, 1, 2])
+        if s1.button(f"Отметить показанные ({len(shown)})", use_container_width=True):
+            picked.update(e["url"] for e in shown)
+            st.rerun()
+        if s2.button("Снять все отметки", use_container_width=True):
+            picked.clear()
+            st.rerun()
+        source = "обновлён из ФГИС" if api_export.LIVE_ENDPOINTS_FILE.exists() else "из корней API на 27.10.2026"
+        s3.caption(f"Эндпоинтов: {len(endpoints)} (список {source}).")
+
+        b1, b2, b3, b4 = st.columns([1, 1, 1, 1])
+        max_records = b1.number_input("Не больше записей с каждого", min_value=0, value=5000, step=1000,
+                                      help="0 — все. У больших списков (заявки — сотни тысяч) полная выгрузка "
+                                           "идёт часами: сначала попробуйте с ограничением.")
+        selected = [e for e in endpoints if e["url"] in picked]
+        if b2.button(f"▶ Выгрузить выбранные ({len(selected)})", type="primary",
+                     disabled=running or bool(busy) or not selected, use_container_width=True):
+            args = ["api_export.py", "--max-records", str(int(max_records))]
+            for e in selected:
+                args += ["--target", f"{e['name']}={e['url']}"]
+            bg_start("export", args, title=f"Выгрузка: {len(selected)} эндп.")
+            st.rerun()
+        if b3.button("⟳ Обновить список из ФГИС", disabled=running or bool(busy), use_container_width=True,
+                     help="Прочитать корни /webapi/v1/, /stencilapi/v1/, /filterapi/v1/, /externalapi/v1/."):
+            bg_start("export", ["api_export.py", "--refresh-endpoints"], title="Обновление списка эндпоинтов")
+            st.rerun()
+        if busy:
+            b4.caption(f"{busy} — выгрузку можно запустить после него.")
+        elif selected:
+            b4.caption("Выбрано: " + ", ".join(e["name"] for e in selected[:8])
+                       + (f" и ещё {len(selected) - 8}" if len(selected) > 8 else ""))
 
     export_panel()
 
-    folders = sorted((p for p in api_export.EXPORT_DIR.glob("*_*") if (p / "records.csv").exists()),
-                     key=lambda p: p.stat().st_mtime, reverse=True)
+    folders = export_folders()
     if not folders:
         return
     st.divider()
@@ -782,19 +844,25 @@ def export_tab():
     def label(folder: Path) -> str:
         try:
             info = json.loads((folder / "info.json").read_text(encoding="utf-8"))
-            title = api_export.DATASETS.get(info["name"], (info["name"],))[0]
-            return f"{title} · {info['exported_at'].replace('T', ' ')} · {info['records']} зап."
+            return f"{info['name']} · {info['exported_at'].replace('T', ' ')} · {info['records']} зап."
         except (FileNotFoundError, ValueError, KeyError):
             return folder.name
 
-    chosen = st.selectbox("Выгрузка", folders, format_func=label)
-    csv_path, raw_path = chosen / "records.csv", chosen / "records.jsonl.gz"
-    d1, d2, _ = st.columns(3)
-    d1.download_button("⬇ CSV (Excel)", csv_path.read_bytes(), file_name=f"{chosen.name}.csv",
-                       use_container_width=True)
-    if raw_path.exists():
-        d2.download_button("⬇ JSONL (всё как в API)", raw_path.read_bytes(), file_name=f"{chosen.name}.jsonl.gz",
+    started = state.get("started")
+    last_run = [f for f in folders if started and datetime.fromtimestamp(f.stat().st_mtime).isoformat() >= started]
+    c1, c2 = st.columns([3, 1])
+    chosen = c1.selectbox("Выгрузка", folders, format_func=label)
+    if last_run:
+        c2.download_button(f"⬇ Последний запуск ({len(last_run)}) zip", zip_folders(last_run),
+                           file_name=f"exports_{started.replace(':', '').replace('-', '')}.zip",
                            use_container_width=True)
+    csv_path, json_path = chosen / "records.csv", chosen / "records.json"
+    d1, d2, _ = st.columns(3)
+    if json_path.exists():
+        d1.download_button("⬇ JSON (всё как в API)", json_path.read_bytes(), file_name=f"{chosen.name}.json",
+                           use_container_width=True)
+    d2.download_button("⬇ CSV (Excel)", csv_path.read_bytes(), file_name=f"{chosen.name}.csv",
+                       use_container_width=True)
     df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig", sep=api_export.CSV_DELIMITER)
     st.caption(f"{len(df)} записей, {len(df.columns)} колонок · папка `{chosen}`")
     st.dataframe(df.head(500), hide_index=True, use_container_width=True, height=420)
