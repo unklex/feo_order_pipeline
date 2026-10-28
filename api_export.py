@@ -8,6 +8,8 @@
     python api_export.py drivers                             # короткие имена: drivers, driver_tasks, …
     python api_export.py --target driver=https://gisopvk.ru/filterapi/v1/driver/ --target trip_report=…
     python api_export.py --target bid=https://gisopvk.ru/stencilapi/v1/order_waste_source/ --max-records 1000
+    python api_export.py --target order_transportation=https://gisopvk.ru/stencilapi/v1/order_transportation/ \
+        --max-records 100 --latest                           # 100 самых свежих (с конца по id), новые — первыми
     python api_export.py --refresh-endpoints                 # обновить список эндпоинтов из корней API
 
 Список эндпоинтов для UI: api_endpoints.json (корни /webapi/v1/ и /stencilapi/v1/), после
@@ -174,20 +176,36 @@ def find_endpoint(fetcher: Fetcher, candidates: list):
     return None, None, None, tried
 
 
-def export(fetcher: Fetcher, name: str, candidates: list, out_root: Path, max_records: int = 0) -> Path:
-    """Выгружает один эндпоинт. max_records > 0 — не больше стольких записей."""
+def export(fetcher: Fetcher, name: str, candidates: list, out_root: Path, max_records: int = 0,
+           latest: bool = False) -> Path:
+    """Выгружает один эндпоинт. max_records > 0 — не больше стольких записей.
+
+    latest (нужен max_records > 0) — не первые, а последние max_records записей по id, самые новые первыми:
+    читаем страницы с offset = всего − max_records, порядок по id остаётся прямым (sort=id всеми поддержан).
+    """
+    latest = latest and max_records > 0
     url, extra, first, tried = find_endpoint(fetcher, candidates)
     for line in tried:
         print(f"  {line}", flush=True)
     if url is None:
         raise LookupError("адрес не отдал список записей")
     count = total({"json": first})
-    limit_note = f" (выгружаем не больше {max_records})" if max_records else ""
+    limit_note = (f" (выгружаем {'последние ' if latest else 'не больше '}{max_records})" if max_records else "")
     print(f"Эндпоинт: {url}, записей: {count}{limit_note}", flush=True)
 
     out = out_root / f"{re.sub(r'[^0-9A-Za-z_-]+', '_', name)}_{datetime.now():%Y%m%d_%H%M%S}"
     out.mkdir(parents=True)
-    rows, seen, offset, body = [], set(), 0, first
+    rows, kept, seen, offset, body = [], [], set(), 0, first
+    cap = 0 if latest else max_records  # в режиме latest читаем до конца списка, обрезаем в конце
+    if latest and not isinstance(count, int) and (isinstance(first.get("meta"), dict)
+                                                  or (first.get("links") or {}).get("next")):
+        raise LookupError("число записей неизвестно — «последние» выбрать нельзя")
+    if latest and isinstance(count, int) and count > max_records:
+        offset = count - max_records
+        r = fetcher.get(url, {"page[limit]": PAGE_LIMIT, "page[offset]": offset, **extra})
+        if r.status_code != 200:
+            raise RuntimeError(f"страница offset={offset}: HTTP {r.status_code}")
+        body = r.json()
     with open(out / "records.json", "w", encoding="utf-8") as raw:
         raw.write("[\n")
         while True:
@@ -198,20 +216,26 @@ def export(fetcher: Fetcher, name: str, candidates: list, out_root: Path, max_re
                     continue  # на стыке страниц, если список сдвинулся
                 if key is not None:
                     seen.add(key)
-                raw.write((",\n" if rows else "") + json.dumps(rec, ensure_ascii=False))
+                if latest:
+                    kept.append(rec)
+                else:
+                    raw.write((",\n" if rows else "") + json.dumps(rec, ensure_ascii=False))
                 rows.append(flatten(rec) if isinstance(rec, dict) else {"value": rec})
-                if max_records and len(rows) >= max_records:
+                if cap and len(rows) >= cap:
                     break
             offset += len(page)
             print(f"получено {len(rows)}" + (f"/{count}" if isinstance(count, int) else ""), flush=True)
             paged = isinstance(body.get("meta"), dict) or bool((body.get("links") or {}).get("next"))
             if (not page or not paged or (isinstance(count, int) and offset >= count)
-                    or (max_records and len(rows) >= max_records)):
+                    or (cap and len(rows) >= cap)):
                 break  # «paged» — у ответа есть пагинация; голый список приходит одной страницей
             r = fetcher.get(url, {"page[limit]": PAGE_LIMIT, "page[offset]": offset, **extra})
             if r.status_code != 200:
                 raise RuntimeError(f"страница offset={offset}: HTTP {r.status_code}")
             body = r.json()
+        if latest:  # последние max_records, новые первыми
+            rows, kept = rows[-max_records:][::-1], kept[-max_records:][::-1]
+            raw.write(",\n".join(json.dumps(rec, ensure_ascii=False) for rec in kept))
         raw.write("\n]\n")
 
     columns = list(dict.fromkeys(k for row in rows for k in row)) or ["id"]  # пустой ответ — файл с заголовком
@@ -224,7 +248,7 @@ def export(fetcher: Fetcher, name: str, candidates: list, out_root: Path, max_re
             w.writerow([excel_safe(row.get(c)) for c in columns])
     (out / "info.json").write_text(json.dumps({
         "name": name, "url": url, "sorted_by_id": bool(extra), "records": len(rows), "total_reported": count,
-        "max_records": max_records, "exported_at": datetime.now().isoformat(timespec="seconds")},
+        "max_records": max_records, "latest": latest, "exported_at": datetime.now().isoformat(timespec="seconds")},
         ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"Готово: {name} — {len(rows)} записей → {out}", flush=True)
     return out
@@ -265,6 +289,8 @@ def main() -> int:
     ap.add_argument("--target", action="append", default=[], metavar="ИМЯ=URL",
                     help="Эндпоинт для выгрузки; можно несколько раз.")
     ap.add_argument("--max-records", type=int, default=0, help="Не больше стольких записей с эндпоинта (0 — все).")
+    ap.add_argument("--latest", action="store_true",
+                    help="С --max-records: взять не первые, а последние (самые свежие по id) записи, новые первыми.")
     ap.add_argument("--refresh-endpoints", action="store_true", help="Обновить список эндпоинтов из корней API.")
     ap.add_argument("--out", default=str(EXPORT_DIR), help="Куда сохранять (по умолчанию exports/).")
     args = ap.parse_args()
@@ -291,7 +317,7 @@ def main() -> int:
         for i, (name, candidates) in enumerate(targets, 1):
             print(f"[{i}/{len(targets)}] {name}", flush=True)
             try:
-                export(fetcher, name, candidates, Path(args.out), args.max_records)
+                export(fetcher, name, candidates, Path(args.out), args.max_records, latest=args.latest)
             except PermissionError:
                 raise
             except Exception as e:

@@ -138,6 +138,24 @@ def test_max_records_and_endpoint_list(tmp_path):
     assert all(ax.is_portal_url(e["url"]) for e in endpoints) and len(endpoints) > 100
 
 
+def test_latest_takes_the_tail_newest_first(tmp_path):
+    session = Session()
+    out = ax.export(ax.Fetcher(session, delay=0), "drivers", CANDIDATES, tmp_path, max_records=30, latest=True)
+    ids = [int(r["id"]) for r in json.loads((out / "records.json").read_text(encoding="utf-8"))]
+    assert ids == list(range(120, 90, -1))
+    assert any(c[1].get("page[offset]") == 90 for c in session.calls)  # не листали с начала
+    rows = list(csv.DictReader(open(out / "records.csv", encoding="utf-8-sig"), delimiter=";"))
+    assert [r["id"] for r in rows] == [str(i) for i in range(120, 90, -1)]
+    info = json.loads((out / "info.json").read_text(encoding="utf-8"))
+    assert info["latest"] is True and info["records"] == 30
+
+
+def test_latest_without_limit_is_ignored(tmp_path):
+    out = ax.export(ax.Fetcher(Session(), delay=0), "drivers", CANDIDATES, tmp_path, latest=True)
+    ids = [r["id"] for r in json.loads((out / "records.json").read_text(encoding="utf-8"))]
+    assert ids[0] == "1"  # latest без max_records — обычная полная выгрузка
+
+
 def test_unpaged_list_is_one_page(tmp_path):
     class Plain(Session):
         def get(self, url, params=None, timeout=None, allow_redirects=True):

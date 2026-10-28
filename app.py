@@ -816,10 +816,15 @@ def export_tab():
         max_records = b1.number_input("Не больше записей с каждого", min_value=0, value=5000, step=1000,
                                       help="0 — все. У больших списков (заявки — сотни тысяч) полная выгрузка "
                                            "идёт часами: сначала попробуйте с ограничением.")
+        latest = b1.checkbox("Свежие: последние по id", value=False, disabled=not max_records,
+                             help="Брать не первые N записей (это 2022 год), а последние N — самые новые, "
+                                  "новые первыми. Работает вместе с ограничением числа записей.")
         selected = [e for e in endpoints if e["url"] in picked]
         if b2.button(f"▶ Выгрузить выбранные ({len(selected)})", type="primary",
                      disabled=running or bool(busy) or not selected, use_container_width=True):
             args = ["api_export.py", "--max-records", str(int(max_records))]
+            if latest and max_records:
+                args.append("--latest")
             for e in selected:
                 args += ["--target", f"{e['name']}={e['url']}"]
             bg_start("export", args, title=f"Выгрузка: {len(selected)} эндп.")
