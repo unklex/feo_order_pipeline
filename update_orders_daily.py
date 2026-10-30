@@ -710,7 +710,8 @@ def main() -> int:
         df_joined['_match'] = df_joined['bitrix_id'].notna().map({True: 1, False: 0})  # 1=по заявке
         matched_by_bid = df_joined['bitrix_id'].notna().sum()
         fb = df_joined['bitrix_id'].isna()
-        df_joined.loc[fb, 'bitrix_id'] = df_joined.loc[fb, 'ID заказа'].map(by_transport)
+        if fb.any():  # pandas 3 не даёт записать пустой (строковый) результат map в int64-колонку
+            df_joined.loc[fb, 'bitrix_id'] = df_joined.loc[fb, 'ID заказа'].map(by_transport)
         df_joined['bitrix_id'] = df_joined['bitrix_id'].astype('Int64')
 
         # 7в. Разные записи файла могут вести в ОДНУ карточку (заявка-матч + fallback
