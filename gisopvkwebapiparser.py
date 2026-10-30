@@ -402,12 +402,13 @@ class GisopvkWebApiParser:
             if response.status_code == 200:
                 try:
                     data = response.json()
-                    # Проверяем, что ответ содержит ожидаемые поля для JSON:API
-                    if 'data' in data and 'links' in data:
+                    # webapi отвечает в JSON:API ("data" + "links"), stencilapi — списком "results"
+                    if isinstance(data, dict) and (('data' in data and 'links' in data)
+                                                   or isinstance(data.get('results'), list)):
                         logger.info("Авторизация работает успешно")
                         return True
                     else:
-                        logger.warning("Ответ не содержит ожидаемых полей JSON:API")
+                        logger.warning("Ответ не содержит ожидаемых полей (data/links или results)")
                         logger.debug(f"Получен ответ: {data}")
                         return False
                 except json.JSONDecodeError:
